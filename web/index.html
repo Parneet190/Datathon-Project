@@ -48,6 +48,14 @@
     }
     .seg button:first-child { border-left: 0; }
     .seg button[aria-pressed="true"] { background: var(--sea); color: #fff; font-weight: 700; }
+    .year-pick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .year-pick button {
+      font: inherit; font-size: 0.88rem; color: var(--ink); background: var(--surface); cursor: pointer;
+      border: 1px solid var(--line); border-radius: 6px; padding: 7px 2px; font-variant-numeric: tabular-nums;
+    }
+    .year-pick button.all { grid-column: 1 / -1; }
+    .year-pick button:disabled { color: var(--muted); background: transparent; border-style: dashed; cursor: not-allowed; }
+    .year-pick button[aria-pressed="true"] { background: var(--sea); border-color: var(--sea); color: #fff; font-weight: 700; }
     .hint { margin: 6px 0 0; font-size: 0.85rem; color: var(--muted); }
     .citywide { margin: 0; font-size: 0.92rem; color: var(--muted); }
     .citywide strong { color: var(--ink); }
@@ -64,7 +72,7 @@
     .change.up { color: #9b2c1f; }
     .change.down { color: #1f6b3a; }
     h2 { font-size: 1rem; margin: 0 0 10px; }
-    .bars { display: grid; grid-template-columns: 70px 1fr 48px; gap: 6px 10px; align-items: center; margin-bottom: 20px; font-size: 0.92rem; }
+    .bars { display: grid; grid-template-columns: 70px 1fr 58px; gap: 6px 10px; align-items: center; margin-bottom: 20px; font-size: 0.92rem; }
     .bar { height: 12px; background: var(--sea-soft); border-radius: 3px; overflow: hidden; }
     .bar span { display: block; height: 100%; background: var(--sea); }
     .bars .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
@@ -83,7 +91,8 @@
     #map .leaflet-tile-pane { filter: grayscale(1) brightness(1.04) contrast(0.92); }
     .legend {
       position: absolute; left: 14px; bottom: 26px; z-index: 1000;
-      background: rgba(255,255,255,0.94); border: 1px solid var(--line); border-radius: 6px;
+      background: rgba(255,255,255,0.6); border: 1px solid var(--line); border-radius: 6px;
+      backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
       padding: 8px 12px; font-size: 0.82rem; white-space: nowrap;
     }
     .legend .ramp { height: 10px; border-radius: 3px; margin: 4px 0 2px;
@@ -115,6 +124,12 @@
       </header>
 
       <section class="controls" aria-label="Filters">
+        <fieldset>
+          <legend>Year</legend>
+          <div class="year-pick" id="years"></div>
+          <p class="hint" id="year-hint"></p>
+        </fieldset>
+
         <div>
           <label for="type">Type of crime</label>
           <select id="type"></select>
@@ -170,6 +185,7 @@
       minZoom: 11,
       maxZoom: 16,          // capped on purpose: VPD offsets locations, so street-level detail would mislead
       radiusMeters: 500,    // size of the area summarized when you click
+      defaultYears: [2026], // years selected when the page opens: [2026], "all", or several like [2024, 2025, 2026]
       defaultType: "all",   // or a label such as "Bike theft" to open on your demo situation
       defaultTime: "any",   // "any", "day", "evening" or "night"
       heatStrength: 1,      // raise if the heat looks faint, lower if everything looks red
@@ -183,10 +199,12 @@
       night: (h) => h >= 22 || (h >= 0 && h < 6),
     };
 
-    // Point layout from prepare_data.py: [lat, lng, typeIndex, hour (-1 = unknown), period (0 = last 12 months, 1 = previous)]
-    const LAT = 0, LNG = 1, TYPE = 2, HOUR = 3, PERIOD = 4;
+    // Point layout from prepare_data.py (version 2): [lat, lng, typeIndex, hour (-1 = unknown), year, month*100 + day]
+    const LAT = 0, LNG = 1, TYPE = 2, HOUR = 3, YEAR = 4, MD = 5;
+    const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-    const state = { data: null, type: "all", time: CONFIG.defaultTime, selected: null };
+    // years: the selected years. shown / compare: which incidents are on the map and which they're compared with
+    const state = { data: null, years: new Set(), type: "all", time: CONFIG.defaultTime, selected: null, shown: null, compare: null };
     const $ = (id) => document.getElementById(id);
     const fmt = (n) => n.toLocaleString("en-CA");
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -203,6 +221,107 @@
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       maxZoom: 19,
     }).addTo(map);
+
+    // ---------------------------------------------------------------------
+    // Step 1b: lighter colour where our data covers, darker everywhere else
+    // ---------------------------------------------------------------------
+    // The covered area is worked out from the incidents in data.json, so no extra file is needed.
+    const SHADE = {
+      inside: [255, 255, 255, 0.25],   // area our data covers: [red, green, blue, strength 0-1] (lighter)
+      outside: [30, 40, 48, 0.55],     // area it doesn't cover (darker)
+      cellMeters: 250,                 // grid size used to find the covered area
+      smoothness: 2,                   // how rounded the border is: 0 = blocky, 1 = slight, 2 = smooth, 3 = very smooth
+      edgeSoftness: 0.15,              // 0.05 = crisp edge, 0.5 = soft faded edge
+    };
+
+    map.createPane("mask");
+    map.getPane("mask").style.zIndex = 350;          // above the grey tiles, below the heat layer
+    map.getPane("mask").style.pointerEvents = "none";
+
+    function addCoverageMask(points) {
+      const SW = [49.0, -123.6], NE = [49.5, -122.7]; // a box bigger than anything the map can show
+      const dLat = SHADE.cellMeters / 111320;
+      const dLng = dLat / Math.cos((49.25 * Math.PI) / 180);
+      const rows = Math.ceil((NE[0] - SW[0]) / dLat);
+      const cols = Math.ceil((NE[1] - SW[1]) / dLng);
+      const idx = (r, c) => r * cols + c;
+
+      // 1. Mark every grid cell that has at least one incident
+      const has = new Uint8Array(rows * cols);
+      for (const p of points) {
+        const r = Math.floor((p[LAT] - SW[0]) / dLat);
+        const c = Math.floor((p[LNG] - SW[1]) / dLng);
+        if (r >= 0 && r < rows && c >= 0 && c < cols) has[idx(r, c)] = 1;
+      }
+
+      // 2. Grow the marked cells by one so small gaps between them close up
+      const covered = new Uint8Array(rows * cols);
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        for (let a = -1; a <= 1 && !covered[idx(r, c)]; a++) for (let b = -1; b <= 1; b++) {
+          const rr = r + a, cc = c + b;
+          if (rr >= 0 && rr < rows && cc >= 0 && cc < cols && has[idx(rr, cc)]) { covered[idx(r, c)] = 1; break; }
+        }
+      }
+
+      // 3. "Outside" = empty cells you can reach from the edge of the box.
+      //    Empty pockets surrounded by covered cells (parks, etc.) count as inside.
+      const outside = new Uint8Array(rows * cols);
+      const stack = [];
+      for (let r = 0; r < rows; r++) stack.push([r, 0], [r, cols - 1]);
+      for (let c = 0; c < cols; c++) stack.push([0, c], [rows - 1, c]);
+      while (stack.length) {
+        const [r, c] = stack.pop();
+        if (r < 0 || r >= rows || c < 0 || c >= cols) continue;
+        const i = idx(r, c);
+        if (outside[i] || covered[i]) continue;
+        outside[i] = 1;
+        stack.push([r + 1, c], [r - 1, c], [r, c + 1], [r, c - 1]);
+      }
+
+      // 4. Smooth the border: blur the grid (three quick box blurs are close to a Gaussian blur)
+      const field = Float32Array.from(outside);
+      const k = SHADE.smoothness;
+      if (k > 0) {
+        const tmp = new Float32Array(rows * cols);
+        for (let pass = 0; pass < 3; pass++) {
+          for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+            let sum = 0, n = 0;
+            for (let d = -k; d <= k; d++) { const cc = c + d; if (cc >= 0 && cc < cols) { sum += field[idx(r, cc)]; n++; } }
+            tmp[idx(r, c)] = sum / n;
+          }
+          for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+            let sum = 0, n = 0;
+            for (let d = -k; d <= k; d++) { const rr = r + d; if (rr >= 0 && rr < rows) { sum += tmp[idx(rr, c)]; n++; } }
+            field[idx(r, c)] = sum / n;
+          }
+        }
+      }
+
+      // 5. Paint at 4x the grid resolution so the curved edge stays smooth (row 0 is the south edge)
+      const UP = 4, W = cols * UP, H = rows * UP;
+      const canvas = document.createElement("canvas");
+      canvas.width = W;
+      canvas.height = H;
+      const ctx = canvas.getContext("2d");
+      const img = ctx.createImageData(W, H);
+      const inC = SHADE.inside, outC = SHADE.outside, e = Math.max(SHADE.edgeSoftness, 0.01);
+      const at = (r, c) => field[idx(Math.min(rows - 1, Math.max(0, r)), Math.min(cols - 1, Math.max(0, c)))];
+      for (let y = 0; y < H; y++) {
+        const gr = (H - y - 0.5) / UP - 0.5, r0 = Math.floor(gr), fr = gr - r0;
+        for (let x = 0; x < W; x++) {
+          const gc = (x + 0.5) / UP - 0.5, c0 = Math.floor(gc), fc = gc - c0;
+          const v = (at(r0, c0) * (1 - fc) + at(r0, c0 + 1) * fc) * (1 - fr)
+                  + (at(r0 + 1, c0) * (1 - fc) + at(r0 + 1, c0 + 1) * fc) * fr;
+          let t = Math.min(1, Math.max(0, (v - 0.5) / e + 0.5));
+          t = t * t * (3 - 2 * t);                       // 0 = inside colour, 1 = outside colour
+          const o = (y * W + x) * 4;
+          for (let ch = 0; ch < 3; ch++) img.data[o + ch] = inC[ch] + (outC[ch] - inC[ch]) * t;
+          img.data[o + 3] = 255 * (inC[3] + (outC[3] - inC[3]) * t);
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      L.imageOverlay(canvas.toDataURL(), [SW, NE], { pane: "mask", interactive: false }).addTo(map);
+    }
 
     // ---------------------------------------------------------------------
     // Step 2: the heat layer (filled once the data loads)
@@ -222,8 +341,34 @@
     // ---------------------------------------------------------------------
     // Filtering
     // ---------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Years: which incidents are shown, and which year they're compared with
+    // ---------------------------------------------------------------------
+    const latestMd = () => { const [, m, d] = state.data.latestDate.split("-").map(Number); return m * 100 + d; };
+    const throughLabel = () => { const md = latestMd(); return `${MONTHS[Math.floor(md / 100) - 1]} ${md % 100}`; };
+    const isPartial = (y) => y === state.data.partialYear;
+    // Years inside the data's range that have no incidents at all (e.g. a year missing from the CSV)
+    function missingYears() {
+      const ys = state.data.years, out = [];
+      for (let y = ys[0]; y <= ys[ys.length - 1]; y++) if (!ys.includes(y)) out.push(y);
+      return out;
+    }
+    const selectedYears = () => state.data.years.filter((y) => state.years.has(y));   // oldest first
+    const allSelected = () => state.years.size === state.data.years.length;
+
+    function buildPeriods() {
+      const ys = selectedYears();
+      state.shown = { years: new Set(ys), maxMd: 1231 };
+      state.compare = null;
+      // With exactly one year selected, compare it with the year before (if that year is in the data).
+      // A part year (like 2026 so far) is compared with the same dates of the year before, so it's fair.
+      if (ys.length === 1 && state.data.years.includes(ys[0] - 1)) {
+        state.compare = { years: new Set([ys[0] - 1]), maxMd: isPartial(ys[0]) ? latestMd() : 1231 };
+      }
+    }
+
     function matches(p, period, { ignoreType = false, ignoreTime = false } = {}) {
-      if (p[PERIOD] !== period) return false;
+      if (!period || !period.years.has(p[YEAR]) || p[MD] > period.maxMd) return false;
       if (!ignoreType && state.type !== "all" && p[TYPE] !== state.type) return false;
       if (!ignoreTime && state.time !== "any") {
         if (p[HOUR] < 0 || !IN_BUCKET[state.time](p[HOUR])) return false;
@@ -231,20 +376,43 @@
       return true;
     }
 
-    // Wording comes from data.json, so the page works for "last 12 months" or a single year like 2026
-    const periodLabel = () => state.data.periodLabel || "in the last 12 months";
-    const hasComparison = () => state.data.compare !== false;
+    // "in 2026 (Jan 1 to Oct 2)", "from 2016 to 2026", or "in 2016–2018 and 2024"
+    function periodLabel() {
+      const ys = selectedYears();
+      if (ys.length === 1) return isPartial(ys[0]) ? `in ${ys[0]} (Jan 1 to ${throughLabel()})` : `in ${ys[0]}`;
+      const runs = [];
+      for (const y of ys) {
+        const last = runs[runs.length - 1];
+        if (last && y === last[1] + 1) last[1] = y; else runs.push([y, y]);
+      }
+      if (runs.length === 1) return `from ${runs[0][0]} to ${runs[0][1]}`;
+      const parts = runs.map(([a, b]) => (a === b ? String(a) : `${a}–${b}`));
+      return `in ${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+    }
+
+    function compareName() {
+      const y = selectedYears()[0];
+      return isPartial(y) ? `the same dates in ${y - 1}` : String(y - 1);
+    }
 
     function typeLabel() {
       return state.type === "all" ? "All types" : state.data.types[state.type].label;
     }
 
     function updateHeat() {
-      const pts = state.data.points.filter((p) => matches(p, 0));
+      const pts = state.data.points.filter((p) => matches(p, state.shown));
       // Scale each point's weight by how many points are showing, so a rare type
-      // (e.g. bike theft) is as readable as all types combined.
-      const weight = Math.min(1, Math.max(0.002, (CONFIG.heatStrength * 350) / Math.max(pts.length, 1)));
-      heat.setLatLngs(pts.map((p) => [p[LAT], p[LNG], weight]));
+      // (e.g. bike theft) or a single year is as readable as all years combined.
+      const weight = Math.min(1, Math.max(0.0002, (CONFIG.heatStrength * 350) / Math.max(pts.length, 1)));
+      // Many incidents share the same hundred-block location, so add repeats together into one heat point.
+      // This looks the same and keeps the map fast with ten years of data.
+      const cells = new Map();
+      for (const p of pts) {
+        const key = Math.round(p[LAT] * 1e4) * 1e7 + Math.round((p[LNG] + 180) * 1e4);
+        const cell = cells.get(key);
+        if (cell) cell[2] += weight; else cells.set(key, [p[LAT], p[LNG], weight]);
+      }
+      heat.setLatLngs([...cells.values()]);
       $("citywide").innerHTML =
         `City-wide for these filters: <strong>${fmt(pts.length)}</strong> reported incidents ${periodLabel()}`;
     }
@@ -274,27 +442,50 @@
       const near = nearFn(state.selected);
       const local = state.data.points.filter(near);
 
-      const now = local.filter((p) => matches(p, 0)).length;
-      const before = local.filter((p) => matches(p, 1)).length;
+      const now = local.filter((p) => matches(p, state.shown)).length;
+      const before = local.filter((p) => matches(p, state.compare)).length;
 
-      // Change from the previous 12 months
-      let changeHtml;
-      if (!hasComparison()) {
-        changeHtml = "";
-      } else if (before < CONFIG.minForChange) {
-        changeHtml = `<p class="change">Too few incidents in the previous 12 months to compare.</p>`;
-      } else {
-        const pct = Math.round(((now - before) / before) * 100);
-        if (Math.abs(pct) < 5) changeHtml = `<p class="change">About the same as the previous 12 months (${fmt(before)}).</p>`;
-        else if (pct > 0) changeHtml = `<p class="change up">Up ${pct}% from the previous 12 months (${fmt(before)}).</p>`;
-        else changeHtml = `<p class="change down">Down ${Math.abs(pct)}% from the previous 12 months (${fmt(before)}).</p>`;
+      // Change from the year before (only when one year is chosen and the year before is in the data)
+      let changeHtml = "";
+      const single = state.years.size === 1 ? selectedYears()[0] : null;
+      if (!state.compare && single && missingYears().includes(single - 1)) {
+        changeHtml = `<p class="change">No ${single - 1} data to compare with.</p>`;
+      } else if (state.compare) {
+        const name = compareName();
+        if (before < CONFIG.minForChange) {
+          changeHtml = `<p class="change">Too few incidents in ${name} to compare.</p>`;
+        } else {
+          const pct = Math.round(((now - before) / before) * 100);
+          if (Math.abs(pct) < 5) changeHtml = `<p class="change">About the same as ${name} (${fmt(before)}).</p>`;
+          else if (pct > 0) changeHtml = `<p class="change up">Up ${pct}% from ${name} (${fmt(before)}).</p>`;
+          else changeHtml = `<p class="change down">Down ${Math.abs(pct)}% from ${name} (${fmt(before)}).</p>`;
+        }
+      }
+
+      // Year by year for this area (only when showing all years)
+      let yearsHtml = "";
+      if (state.years.size > 1) {
+        const perYear = new Map(selectedYears().map((y) => [y, 0]));
+        for (const p of local) if (matches(p, state.shown)) perYear.set(p[YEAR], perYear.get(p[YEAR]) + 1);
+        const maxYear = Math.max(1, ...perYear.values());
+        const partial = state.data.partialYear;
+        const sel = selectedYears();
+        const gaps = missingYears().filter((y) => y > sel[0] && y < sel[sel.length - 1]);
+        const rows = [...perYear.keys(), ...gaps].sort((a, b) => a - b);
+        yearsHtml = `<h2>Year by year</h2>
+          <div class="bars">${rows.map((y) => gaps.includes(y) ? `
+            <span>${y}</span><span class="hint" style="margin:0">no data</span><span></span>` : `
+            <span>${y}${isPartial(y) ? "*" : ""}</span>
+            <div class="bar"><span style="width:${(perYear.get(y) / maxYear) * 100}%"></span></div>
+            <span class="n">${fmt(perYear.get(y))}</span>`).join("")}</div>
+          ${perYear.has(partial) ? `<p class="hint" style="margin:-12px 0 16px">* ${partial} runs to ${throughLabel()} only</p>` : ""}`;
       }
 
       // When these happen: uses the chosen crime type, all times of day
       const buckets = { day: 0, evening: 0, night: 0 };
       let unknownHour = 0;
       for (const p of local) {
-        if (!matches(p, 0, { ignoreTime: true })) continue;
+        if (!matches(p, state.shown, { ignoreTime: true })) continue;
         if (p[HOUR] < 0) { unknownHour++; continue; }
         for (const b in IN_BUCKET) if (IN_BUCKET[b](p[HOUR])) buckets[b]++;
       }
@@ -308,7 +499,7 @@
       let topHtml = "";
       if (state.type === "all") {
         const counts = new Map();
-        for (const p of local) if (matches(p, 0)) counts.set(p[TYPE], (counts.get(p[TYPE]) || 0) + 1);
+        for (const p of local) if (matches(p, state.shown)) counts.set(p[TYPE], (counts.get(p[TYPE]) || 0) + 1);
         const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
         if (top.length) {
           topHtml = `<h2>Most common here</h2><ol class="top">${top.map(([t, n]) =>
@@ -328,6 +519,7 @@
         <p class="count-label">reported incidents within ${CONFIG.radiusMeters} m ${periodLabel()}</p>
         <p class="showing">Showing ${typeLabel().toLowerCase()}, ${TIME_LABELS[state.time]}</p>
         ${changeHtml}
+        ${yearsHtml}
         <h2>When these happen</h2>
         <div class="bars">${barsHtml}</div>
         ${unknownHour ? `<p class="hint" style="margin:-12px 0 16px">${fmt(unknownHour)} with no time recorded</p>` : ""}
@@ -341,9 +533,39 @@
     function buildControls() {
       const { types, neighbourhoods, points } = state.data;
 
-      // Crime types, most common first
+      // Years: an "All years" button, then one button per year, newest first
+      const ys = state.data.years;
+      const missing = missingYears();
+      const span = [];
+      for (let y = ys[ys.length - 1]; y >= ys[0]; y--) span.push(y);   // newest first, gaps included
+      $("years").innerHTML = (ys.length > 1 ? `<button type="button" class="all" data-year="all">All years</button>` : "") +
+        span.map((y) => missing.includes(y)
+          ? `<button type="button" disabled title="No data for ${y}">${y}</button>`
+          : `<button type="button" data-year="${y}">${y}</button>`).join("");
+      $("year-hint").textContent = "Tap years to add or remove them." +
+        (state.data.partialYear ? ` ${state.data.partialYear} runs to ${throughLabel()}.` : "") +
+        (missing.length ? ` No data for ${missing.join(", ")}.` : "");
+
+      const start = CONFIG.defaultYears === "all" ? ys : [].concat(CONFIG.defaultYears).map(Number).filter((y) => ys.includes(y));
+      state.years = new Set(start.length ? start : [ys[ys.length - 1]]);   // fall back to the latest year
+
+      $("years").addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-year]");
+        if (!btn || btn.disabled) return;
+        if (btn.dataset.year === "all") {
+          state.years = new Set(ys);
+        } else {
+          const y = Number(btn.dataset.year);
+          if (allSelected()) state.years = new Set([y]);          // from "All years", a tap picks just that year
+          else if (!state.years.has(y)) state.years.add(y);       // add a year
+          else if (state.years.size > 1) state.years.delete(y);   // remove it, but always keep at least one
+        }
+        refresh();
+      });
+
+      // Crime types, most common first (across all years)
       const totals = new Array(types.length).fill(0);
-      for (const p of points) if (p[PERIOD] === 0) totals[p[TYPE]]++;
+      for (const p of points) totals[p[TYPE]]++;
       const order = types.map((_, i) => i).sort((a, b) => totals[b] - totals[a]);
       $("type").innerHTML = `<option value="all">All types</option>` +
         order.map((i) => `<option value="${i}">${types[i].label}</option>`).join("");
@@ -381,10 +603,29 @@
       }
     }
 
+    function syncYearButtons() {
+      const all = allSelected() && state.data.years.length > 1;
+      for (const btn of document.querySelectorAll("#years button")) {
+        const on = btn.dataset.year === "all" ? all : !all && state.years.has(Number(btn.dataset.year));
+        btn.setAttribute("aria-pressed", String(on));
+      }
+    }
+
     function refresh() {
+      buildPeriods();
+      syncYearButtons();
       syncTimeButtons();
       updateHeat();
       renderSummary();
+      renderAbout();
+    }
+
+    function noLocationCount() {
+      let n = 0;
+      for (const [y, count] of Object.entries(state.data.noLocationByYear || {})) {
+        if (state.shown.years.has(Number(y))) n += count;
+      }
+      return n;
     }
 
     function renderAbout() {
@@ -393,7 +634,7 @@
       $("about").innerHTML = `
         <p>Source: Vancouver Police Department, <a href="https://geodash.vpd.ca/opendata/">GeoDASH open data</a>. Data through ${through}.</p>
         <p>Shows reported incidents that police confirmed occurred, not all crime. Busy areas show more because more people are there.</p>
-        <p>VPD offsets locations for privacy: property crimes to the hundred block, offences against a person across several blocks. ${fmt(d.noLocation ?? d.noLocationLast12 ?? 0)} incidents ${periodLabel()} have no location and aren't shown.</p>`;
+        <p>VPD offsets locations for privacy: property crimes to the hundred block, offences against a person across several blocks. ${fmt(noLocationCount())} incidents ${periodLabel()} have no location and aren't shown.</p>`;
       $("legend-title").textContent = `Reported incidents ${periodLabel()}`;
     }
 
@@ -418,9 +659,13 @@
         showError(`Couldn't load <code>${CONFIG.dataUrl}</code>. Run <code>python scripts/prepare_data.py</code> from the project folder to create it, then reload this page.`);
         return;
       }
+      if (!Array.isArray(state.data.years)) {
+        showError(`This <code>data.json</code> was made by the old script. Run <code>python scripts/prepare_data.py</code> from version 2, then reload this page.`);
+        return;
+      }
       $("status").classList.remove("show");
+      addCoverageMask(state.data.points);
       buildControls();
-      renderAbout();
       refresh();
     }
 
