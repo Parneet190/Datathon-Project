@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
 Turn the VPD GeoDASH crime CSV into a small data.json that the website loads.
+Version 2: keeps every year in the data, so the website can show one year or all years.
 
 Usage (run from the repository root):
     python scripts/prepare_data.py                       # uses every .csv in data/raw/ (subfolders too)
     python scripts/prepare_data.py data/raw/myfile.csv   # or point to specific files
-    python scripts/prepare_data.py --year 2026           # show one calendar year only
+    python scripts/prepare_data.py --from-year 2016      # skip years before 2016
     python scripts/prepare_data.py --out web/data.json
 
 What it does:
   1. Reads the VPD CSV (columns: TYPE, YEAR, MONTH, DAY, HOUR, MINUTE,
      HUNDRED_BLOCK, NEIGHBOURHOOD, X, Y)
-  2. Drops rows with no location (VPD sets X and Y to 0 for privacy)
-     and rows that fall outside Vancouver
+  2. Skips blank rows, drops rows with no location (VPD sets X and Y to 0 or
+     leaves them empty for privacy) and rows that fall outside Vancouver
   3. Converts X/Y from UTM zone 10N metres to latitude/longitude
-  4. Keeps two 12-month windows ending on the latest date in the data:
-     "last 12 months" (shown on the map) and "previous 12 months" (for comparison),
-     or with --year, just that one calendar year
+  4. Keeps the year and date of every incident, so the website can filter by year
+     and compare a part-year (like 2026 so far) with the same months of the year before
   5. Renames VPD crime types to plain-language labels
   6. Writes web/data.json and prints a summary you can use to check the app
 
@@ -29,7 +29,7 @@ import json
 import math
 import sys
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -58,7 +58,6 @@ BLURRED_TYPES = {"Offence Against a Person", "Homicide"}
 LAT_RANGE = (49.19, 49.32)
 LNG_RANGE = (-123.28, -123.00)
 
-WINDOW_DAYS = 365
 
 
 # --- UTM zone 10N (NAD83 / GRS80) to latitude/longitude ----------------------
@@ -135,7 +134,7 @@ def read_rows(paths):
             if missing:
                 sys.exit(f"{path.name} is missing expected columns: {', '.join(sorted(missing))}")
             for row in reader:
-                yield row
+                yield path, row
 
 
 def find_default_csvs():
@@ -154,7 +153,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv", nargs="*", help="VPD crime CSV file(s) (default: every .csv in data/raw/)")
     parser.add_argument("--out", default=str(DEFAULT_OUT), help="Where to write data.json (default: web/data.json)")
-    parser.add_argument("--year", type=int, help="Show one calendar year only, e.g. 2026 (no year-over-year comparison)")
+    parser.add_argument("--from-year", type=int, help="Skip years before this one, e.g. 2016")
+    parser.add_argument("--to-year", type=int, help="Skip years after this one")
     args = parser.parse_args()
 
     src = [Path(p) for p in args.csv] if args.csv else find_default_csvs()
@@ -162,66 +162,42 @@ def main():
     print("Reading:")
     for path in src:
         print(f"  {path}")
-    names = " ".join(p.name.lower() for p in src)
-    if "allyears" in names and len(src) > 1:
-        print("\nWarning: you have an all-years file plus other files, so incidents may be counted twice. "
-              "Keep only one set in data/raw/.")
 
-    # Pass 1: find the latest date in the data so the windows end there.
-    latest = None
-    for row in read_rows(src):
-        d = row_date(row)
-        if d and (args.year is None or d.year == args.year) and (latest is None or d > latest):
-            latest = d
-    if latest is None:
-        sys.exit(f"Couldn't find any valid dates{f' in {args.year}' if args.year else ''} in the CSV.")
+    def wanted(d):
+        return (args.from_year is None or d.year >= args.from_year) and (args.to_year is None or d.year <= args.to_year)
 
-    if args.year:
-        # Single-year mode: everything in that year is shown, nothing to compare against.
-        shown_start = date(args.year, 1, 1)
-        period_label = f"in {args.year}"
-        compare = False
-
-        def classify(d):
-            return 0 if d.year == args.year else None
-    else:
-        # Default: last 12 months on the map, previous 12 months for comparison.
-        last_start = latest - timedelta(days=WINDOW_DAYS)      # last window: (last_start, latest]
-        prev_start = last_start - timedelta(days=WINDOW_DAYS)  # previous window: (prev_start, last_start]
-        shown_start = last_start + timedelta(days=1)
-        period_label = "in the last 12 months"
-        compare = True
-
-        def classify(d):
-            if prev_start < d <= latest:
-                return 0 if d > last_start else 1
-            return None
-
-    # Pass 2: filter, convert, and collect points.
     stats = Counter()
     type_index = {}
     types = []
     points = []
     hood_sums = defaultdict(lambda: [0.0, 0.0, 0])
-    last_counts_by_type = Counter()
+    by_year = Counter()
+    by_type = Counter()
+    no_location_by_year = Counter()
+    years_in_file = defaultdict(set)
+    latest = None
 
-    for row in read_rows(src):
+    for path, row in read_rows(src):
+        if not any((v or "").strip() for v in row.values()):
+            stats["skipped: blank row"] += 1
+            continue
         stats["rows read"] += 1
         d = row_date(row)
         if d is None:
             stats["skipped: bad date"] += 1
             continue
-        period = classify(d)
-        if period is None:
-            stats["skipped: outside the date range"] += 1
+        years_in_file[d.year].add(path.name)
+        if not wanted(d):
+            stats["skipped: outside the chosen years"] += 1
             continue
+        if latest is None or d > latest:
+            latest = d
 
         vpd_type = (row.get("TYPE") or "").strip() or "Unknown"
         x, y = to_float(row.get("X")), to_float(row.get("Y"))
         if not x or not y:
             stats["skipped: no location (privacy)"] += 1
-            if period == 0:
-                stats["no location, in the shown period"] += 1
+            no_location_by_year[d.year] += 1
             continue
 
         lat, lng = utm10n_to_latlng(x, y)
@@ -235,36 +211,54 @@ def main():
         hour = to_int(row.get("HOUR"))
         hour = hour if hour is not None and 0 <= hour <= 23 else -1
 
-        points.append([round(lat, 5), round(lng, 5), type_index[vpd_type], hour, period])
-        stats["kept: shown on the map" if period == 0 else "kept: previous 12 months (comparison)"] += 1
+        # 4 decimals is about 10 m, finer than VPD's hundred-block offsets, and keeps the file small
+        points.append([round(lat, 4), round(lng, 4), type_index[vpd_type], hour, d.year, d.month * 100 + d.day])
+        stats["kept: shown on the map"] += 1
+        by_year[d.year] += 1
+        by_type[vpd_type] += 1
 
-        if period == 0:
-            last_counts_by_type[vpd_type] += 1
-            hood = (row.get("NEIGHBOURHOOD") or "").strip()
-            if hood:
-                s = hood_sums[hood]
-                s[0] += lat
-                s[1] += lng
-                s[2] += 1
+        hood = (row.get("NEIGHBOURHOOD") or "").strip()
+        if hood:
+            s = hood_sums[hood]
+            s[0] += lat
+            s[1] += lng
+            s[2] += 1
 
+    if latest is None:
+        sys.exit("Couldn't find any incidents with valid dates in the chosen years.")
+
+    # Same year in more than one file means incidents would be counted twice
+    doubled = {yr: files for yr, files in years_in_file.items() if len(files) > 1}
+    if doubled:
+        print("\nWarning: these years appear in more than one file, so incidents may be counted twice:")
+        for yr in sorted(doubled):
+            print(f"  {yr}: {', '.join(sorted(doubled[yr]))}")
+        print("Keep only one copy of each year in data/raw/ and run this again.")
+
+    years = sorted(by_year)
+    missing = [yr for yr in range(years[0], years[-1] + 1) if yr not in by_year]
+    if missing:
+        print(f"\nWarning: no incidents at all for {', '.join(map(str, missing))}. "
+              "That year is probably missing from the CSV. Download it from GeoDASH, put it in data/raw/ and run this again.")
     neighbourhoods = sorted(
         ({"name": name, "lat": round(s[0] / s[2], 5), "lng": round(s[1] / s[2], 5)} for name, s in hood_sums.items()),
         key=lambda h: h["name"],
     )
 
     data = {
+        "version": 2,
         "source": "Vancouver Police Department, GeoDASH Open Data (https://geodash.vpd.ca/opendata/)",
         "generated": datetime.now().isoformat(timespec="seconds"),
         "latestDate": latest.isoformat(),
-        "shownStart": shown_start.isoformat(),
-        "periodLabel": period_label,
-        "compare": compare,
-        "noLocation": stats["no location, in the shown period"],
+        "years": years,
+        # The latest year is only partly covered unless the data runs to December 31
+        "partialYear": latest.year if (latest.month, latest.day) != (12, 31) else None,
+        "noLocationByYear": {str(yr): no_location_by_year[yr] for yr in years},
         "types": [
             {"label": TYPE_LABELS.get(t, t), "vpd": t, "blurred": t in BLURRED_TYPES} for t in types
         ],
         "neighbourhoods": neighbourhoods,
-        # Each point: [lat, lng, type index, hour (-1 if unknown), period (0 = shown on map, 1 = comparison)]
+        # Each point: [lat, lng, type index, hour (-1 if unknown), year, month*100 + day (e.g. 1002 = Oct 2)]
         "points": points,
     }
 
@@ -273,15 +267,21 @@ def main():
         json.dump(data, f, separators=(",", ":"))
 
     # Summary: use these numbers to check the app shows the same totals.
-    print(f"\nData runs through {latest.isoformat()}")
-    print(f"Shown on the map: {data['shownStart']} to {latest.isoformat()}\n")
+    print(f"\nYears in the data: {years[0]} to {years[-1]}, latest incident {latest.isoformat()}")
+    if data["partialYear"]:
+        print(f"{data['partialYear']} is a part year (January 1 to {latest.strftime('%B %d').replace(' 0', ' ')})\n")
     for key in sorted(stats):
         print(f"  {key:<40} {stats[key]:>9,}")
-    print(f"\nIncidents on the map {period_label}, by type:")
-    for t, n in last_counts_by_type.most_common():
+    print("\nIncidents on the map, by year:")
+    for yr in years:
+        print(f"  {yr:<40} {by_year[yr]:>9,}")
+    print("\nIncidents on the map (all years), by type:")
+    for t, n in by_type.most_common():
         print(f"  {TYPE_LABELS.get(t, t):<40} {n:>9,}")
     size_mb = out.stat().st_size / 1_000_000
     print(f"\nWrote {out} ({size_mb:.1f} MB, {len(points):,} points)")
+    if size_mb > 50:
+        print("That's big for GitHub. Use --from-year to drop older years if the page loads slowly.")
 
 
 if __name__ == "__main__":
