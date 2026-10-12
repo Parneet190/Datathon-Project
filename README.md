@@ -6,8 +6,7 @@ VanScene is a simple web app that shows patterns of reported crime in Vancouver,
 
 It is one input to a newcomer's research, alongside visiting neighbourhoods, talking to locals, and other sources. **It does not rate the safety of any location.**
 
-**Live app:** [add your GitHub Pages link]
-**Team:** [team name] · **Datathon:** Build Trilemma Datathon 2026 · **Status:** Build Session 2 complete, preparing for Build Session 3
+**Team:** Crimes Against Humanity · **Datathon:** Build Trilemma Datathon 2026 · **Status:** Build Session 2 complete, preparing for Build Session 3
 
 ---
 
