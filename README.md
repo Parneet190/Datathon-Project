@@ -8,6 +8,8 @@ It is one input to a newcomer's research, alongside visiting neighbourhoods, tal
 
 **Team:** Crimes Against Humanity · **Datathon:** Build Trilemma Datathon 2026 · **Status:** Build Session 2 complete, preparing for Build Session 3
 
+▶️ **[Watch the 60-second demo](https://youtu.be/DbSOYitXOZY)**
+
 ---
 
 ## What the app does
