@@ -232,7 +232,7 @@ Initial exploration of 2026 data (January 1 to October 2, 2026):
 ├── README.md
 ├── .gitignore            # excludes raw VPD CSVs and zip files
 ├── data/
-│   ├── raw/              # put downloaded VPD CSVs here (not committed)
+│   ├── raw/              # create locally for the VPD CSVs (not in the repo)
 │   └── vpd/              # VPD's legal disclaimer and data description
 ├── scripts/
 │   └── prepare_data.py   # turns the raw CSVs into web/data.json
