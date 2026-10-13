@@ -689,8 +689,8 @@
       return { paddingTopLeft: [l + gap, t + gap], paddingBottomRight: [r + gap, b + gap] };
     }
     function fitTo(bounds, maxZoom = 14) {
-      const opts = { ...panelPadding(), maxZoom };
-      if (reduceMotion) map.fitBounds(bounds, opts); else map.flyToBounds(bounds, { ...opts, duration: 0.7 });
+      // A normal zoom, not flyTo: the heat layer can follow a normal zoom, but drifts during a flyTo
+      map.fitBounds(bounds, { ...panelPadding(), maxZoom, animate: !reduceMotion });
     }
     const areaBounds = (ll) => ll.toBounds(CONFIG.radiusMeters * 3.2);
     function fitForView() {
@@ -947,16 +947,21 @@
       show(circleA, state.view === "compare" && !!state.a);
       show(circleB, state.view === "compare" && !!state.b);
     }
-    function setView(view, { fit = true } = {}) {
+    // Each view's panel, and how far it was scrolled, so switching views puts you back where you were
+    const PANEL_FOR = { map: "area", compare: "compare", trends: "trends" };
+    const panelScroll = {};
+
+    function setView(view) {
+      panelScroll[state.view] = $(PANEL_FOR[state.view]).scrollTop;   // remember the panel you're leaving
       state.view = view;
       $("app").dataset.view = view;
       for (const b of document.querySelectorAll(".views button")) b.setAttribute("aria-pressed", String(b.dataset.view === view));
       if (view === "compare" && !state.a && state.selected) { state.a = state.selected; state.nextSlot = "b"; }
       syncCircles();
       renderPanels();
-      if (fit) requestAnimationFrame(fitForView);
+      $(PANEL_FOR[view]).scrollTop = panelScroll[view] || 0;           // and put this one back where it was
+      // The map isn't moved or zoomed: it stays exactly where you left it.
     }
-
     // ---------------------------------------------------------------------
     // Controls
     // ---------------------------------------------------------------------
@@ -1140,7 +1145,7 @@
       addCoverageMask(state.data.points);
       buildControls();
       buildPeriods();
-      setView(["map", "compare", "trends"].includes(CONFIG.defaultView) ? CONFIG.defaultView : "map", { fit: false });
+      setView(["map", "compare", "trends"].includes(CONFIG.defaultView) ? CONFIG.defaultView : "map");
       refresh();
       requestAnimationFrame(() => map.fitBounds(CITY_BOUNDS, { ...panelPadding(), maxZoom: 13 }));
     }
