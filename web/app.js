@@ -554,9 +554,10 @@ function bindTimeControls() {
 // The heat map
 // ---------------------------------------------------------------------
 // Incidents per year at each location: [lat, lng, count]. heatSpots is what you selected; refSpots is
-// the average year across all the data (same crime type, all times of day), which sets one fixed colour
-// scale, so a year with fewer incidents really does look fainter. A part of the day is drawn per hour on
-// that same scale (see updateHeat), so it compares fairly with "Any time" too.
+// the average year across all the data (every crime type, all times of day), which sets one fixed colour
+// scale, so a year with fewer incidents really does look fainter, and so does a rarer crime type: with its
+// own scale, an evenly spread type like home break-ins turned the whole city red. A part of the day is drawn
+// per hour on that same scale (see updateHeat), so it compares fairly with "Any time" too.
 let heatSpots = [], refSpots = [];
 
 // A part year (2026 so far) counts as a full year's rate, so it compares fairly with whole years
@@ -587,7 +588,7 @@ function updateHeat() {
   // exactly as busy per hour as the whole day looks like "Any time"; busier parts glow more, quieter ones less.
   const hrs = state.hours ? state.hours.size : 0;   // 0 for "Any time"
   heatSpots = n ? spotsPerYear((p) => matches(p, state.shown), n, hrs ? 24 / hrs : 1) : [];
-  refSpots = spotsPerYear(hrs ? (p) => p[HOUR] >= 0 && passesFilters(p, { ignoreTime: true }) : (p) => passesFilters(p),
+  refSpots = spotsPerYear((p) => (!hrs || p[HOUR] >= 0) && passesFilters(p, { ignoreType: true, ignoreTime: true }),
     state.data.years.length);
   fadeHeat();
   drawHeat();
