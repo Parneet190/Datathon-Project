@@ -18,7 +18,7 @@
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
 
   <link rel="stylesheet" href="styles.css">
@@ -71,13 +71,17 @@
         </div>
         <fieldset>
           <legend class="lab">Time of day</legend>
-          <div class="seg" id="time">
-            <button type="button" data-time="any" aria-pressed="true">Any time</button>
-            <button type="button" data-time="day" aria-pressed="false" title="6 am to 6 pm">Day</button>
-            <button type="button" data-time="evening" aria-pressed="false" title="6 pm to 10 pm">Evening</button>
-            <button type="button" data-time="night" aria-pressed="false" title="10 pm to 6 am">Night</button>
+          <!-- A 24-hour track from 6 am round to 6 am: four equal parts (pick one or more), when reports happen drawn
+               under them as bars you can click or drag across to pick single hours, then the hour marks -->
+          <div class="day-track" id="time">
+            <button type="button" class="all" data-time="any" hidden aria-label="Clear the picked hours: back to any time">Clear</button>
+            <button type="button" data-time="morning" aria-pressed="false" aria-label="Morning, 6 am to 12 pm">Morning</button>
+            <button type="button" data-time="afternoon" aria-pressed="false" aria-label="Afternoon, 12 pm to 6 pm">Afternoon</button>
+            <button type="button" data-time="evening" aria-pressed="false" aria-label="Evening, 6 pm to 12 am">Evening</button>
+            <button type="button" data-time="overnight" aria-pressed="false" aria-label="Overnight, 12 am to 6 am">Overnight</button>
+            <div class="track-bars" id="track-bars" role="group" aria-label="Hours of the day: click or drag across them to pick hours"></div>
+            <span class="tick" aria-hidden="true">6 am</span><span class="tick" aria-hidden="true">12 pm</span><span class="tick" aria-hidden="true">6 pm</span><span class="tick" aria-hidden="true">12 am</span>
           </div>
-          <p class="hint" id="time-hint"></p>
         </fieldset>
         <p class="citywide" id="citywide"></p>
       </div>
