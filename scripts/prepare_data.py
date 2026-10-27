@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Turn the VPD GeoDASH crime CSV into a small data.json that the website loads.
-Version 2: keeps every year in the data, so the website can show one year or all years.
+Version 3: keeps every year in the data, so the website can show one year or all years,
+and stores the points as one list per field, which makes the file much smaller to download.
 
 Usage (run from the repository root):
     python scripts/prepare_data.py                       # uses every .csv in data/raw/ (subfolders too)
@@ -19,6 +20,7 @@ What it does:
      and compare a part-year (like 2026 so far) with the same months of the year before
   5. Renames VPD crime types to plain-language labels
   6. Writes web/data.json and prints a summary you can use to check the app
+     (points sorted by place and stored column by column, see columns() below)
 
 Only the Python standard library is needed.
 """
@@ -53,6 +55,14 @@ TYPE_LABELS = {
 
 # VPD randomizes these locations across several blocks, so the app flags them as area-level only.
 BLURRED_TYPES = {"Offence Against a Person", "Homicide"}
+
+
+def plain(text):
+    """VPD's type and neighbourhood names end up in the page's HTML, so refuse anything that could become markup."""
+    if any(c in text for c in "<>\"'`"):
+        sys.exit(f"Unexpected characters in VPD text, not publishing: {text!r}")
+    return text
+
 
 # Rough box around the City of Vancouver; anything outside is treated as bad data.
 LAT_RANGE = (49.19, 49.32)
@@ -148,6 +158,28 @@ def find_default_csvs():
     return csvs
 
 
+def columns(points):
+    """The points as one list per field, which compresses far better than one list per point.
+
+    Latitude and longitude become whole numbers of 1/10,000 degree (the same 4 decimals as before)
+    counted from the south-west corner of LAT_RANGE/LNG_RANGE, so they're short and never negative.
+    Rows are sorted by place first: neighbouring rows then share most of their digits, and that
+    roughly halves the compressed size. The app doesn't depend on the order of the points.
+    """
+    lat0, lng0 = round(LAT_RANGE[0] * 1e4), round(LNG_RANGE[0] * 1e4)
+    points = sorted(points)
+    return {
+        "lat0": lat0,   # in 1/10,000 degree: a point's latitude is (lat0 + lat[i]) / 10000
+        "lng0": lng0,
+        "lat": [round(p[0] * 1e4) - lat0 for p in points],
+        "lng": [round(p[1] * 1e4) - lng0 for p in points],
+        "type": [p[2] for p in points],
+        "hour": [p[3] for p in points],
+        "year": [p[4] for p in points],
+        "md": [p[5] for p in points],
+    }
+
+
 # --- Main ---------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -193,7 +225,7 @@ def main():
         if latest is None or d > latest:
             latest = d
 
-        vpd_type = (row.get("TYPE") or "").strip() or "Unknown"
+        vpd_type = plain((row.get("TYPE") or "").strip() or "Unknown")
         x, y = to_float(row.get("X")), to_float(row.get("Y"))
         if not x or not y:
             stats["skipped: no location (privacy)"] += 1
@@ -217,7 +249,7 @@ def main():
         by_year[d.year] += 1
         by_type[vpd_type] += 1
 
-        hood = (row.get("NEIGHBOURHOOD") or "").strip()
+        hood = plain((row.get("NEIGHBOURHOOD") or "").strip())
         if hood:
             s = hood_sums[hood]
             s[0] += lat
@@ -246,7 +278,7 @@ def main():
     )
 
     data = {
-        "version": 2,
+        "version": 3,
         "source": "Vancouver Police Department, GeoDASH Open Data (https://geodash.vpd.ca/opendata/)",
         "generated": datetime.now().isoformat(timespec="seconds"),
         "latestDate": latest.isoformat(),
@@ -258,8 +290,9 @@ def main():
             {"label": TYPE_LABELS.get(t, t), "vpd": t, "blurred": t in BLURRED_TYPES} for t in types
         ],
         "neighbourhoods": neighbourhoods,
-        # Each point: [lat, lng, type index, hour (-1 if unknown), year, month*100 + day (e.g. 1002 = Oct 2)]
-        "points": points,
+        # One list per field; point i is lat[i], lng[i], type index, hour (-1 if unknown), year,
+        # month*100 + day (e.g. 1002 = Oct 2). See columns() above.
+        "points": columns(points),
     }
 
     out.parent.mkdir(parents=True, exist_ok=True)
