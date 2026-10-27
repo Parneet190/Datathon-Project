@@ -885,7 +885,6 @@ function buildControls() {
   });
 
   // Neighbourhood search: pick from the list (or type part of a name and press Enter)
-  $("hood-list").innerHTML = neighbourhoods.map((h) => `<option value="${h.name}">`).join("");
   const goToHood = () => {
     const q = $("search").value.trim().toLowerCase();
     if (!q) return;
@@ -897,8 +896,48 @@ function buildControls() {
     if (isPhone()) closeFilters();
     fitForView();
   };
-  $("search").addEventListener("change", goToHood);
-  $("search").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); goToHood(); } });
+  // The suggestion list: names containing what's typed, alphabetical; arrows move, Enter picks, Escape closes
+  const input = $("search"), list = $("hood-list");
+  const names = neighbourhoods.map((h) => h.name).sort((a, b) => a.localeCompare(b));
+  let shownNames = [], active = -1;
+  const option = (i) => list.children[i];
+  const setActive = (i) => {
+    if (option(active)) option(active).setAttribute("aria-selected", "false");
+    active = i;
+    if (option(i)) { option(i).setAttribute("aria-selected", "true"); option(i).scrollIntoView({ block: "nearest" }); input.setAttribute("aria-activedescendant", option(i).id); }
+    else input.removeAttribute("aria-activedescendant");
+  };
+  const closeList = () => { list.hidden = true; input.setAttribute("aria-expanded", "false"); setActive(-1); };
+  const openList = () => {
+    const q = input.value.trim().toLowerCase();
+    shownNames = names.filter((n) => n.toLowerCase().includes(q));
+    list.replaceChildren(...shownNames.map((n, i) =>
+      Object.assign(document.createElement("li"), { id: `hood-${i}`, role: "option", textContent: n })));
+    list.hidden = !shownNames.length;
+    input.setAttribute("aria-expanded", String(!list.hidden));
+    setActive(-1);
+  };
+  const pick = (name) => { input.value = name; closeList(); goToHood(); };
+  input.addEventListener("focus", openList);
+  input.addEventListener("input", openList);
+  input.addEventListener("blur", closeList);
+  // mousedown, not click, so the input's blur doesn't close the list before the pick lands
+  list.addEventListener("mousedown", (e) => { const li = e.target.closest("li"); if (li) { e.preventDefault(); pick(li.textContent); } });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (list.hidden) openList();
+      const n = shownNames.length;
+      if (n) setActive(e.key === "ArrowDown" ? (active + 1) % n : (active - 1 + n) % n);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (active >= 0) pick(shownNames[active]); else { closeList(); goToHood(); }
+    } else if (e.key === "Escape" && !list.hidden) {
+      e.preventDefault();   // a search box clears itself on Escape, which would reopen the list
+      closeList();
+    }
+  });
+  input.addEventListener("click", () => { if (list.hidden) openList(); });   // already focused, so no focus event
 
   map.on("click", (e) => {
     // Outside the data there's nothing to summarize, so say so and keep whatever was selected

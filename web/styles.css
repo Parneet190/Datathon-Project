@@ -20,7 +20,6 @@
   /* Heat map colours, fewest to most: on a light map "more" gets darker, on a dark map it gets brighter */
   --ramp-1: #fde68a; --ramp-2: #fbbf24; --ramp-3: #f97316; --ramp-4: #dc2626; --ramp-5: #7f1d1d;
   --heat-blend: multiply;  /* lets street names show through the heat */
-  --mark-ring: var(--ramp-3);
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --map-bg: #e8ecee;
   --status-bg: rgba(238, 242, 243, 0.92);
@@ -41,7 +40,6 @@
   --tile-filter: grayscale(1) invert(1) brightness(0.9) contrast(0.85);
   --ramp-1: #51127c; --ramp-2: #b73779; --ramp-3: #fc8961; --ramp-4: #fecf8f; --ramp-5: #fcfdbf;
   --heat-blend: screen;
-  --mark-ring: var(--ramp-2);
   color-scheme: dark;
 }
 
@@ -55,18 +53,19 @@ a { color: var(--sea); }
 
 /* ---------------- Site header ---------------- */
 .site-head { flex: none; height: 58px; display: flex; align-items: center; gap: 14px; padding: 0 18px; background: var(--surface); border-bottom: 1px solid var(--line); position: relative; z-index: 20; }
-/* A small hotspot in the heat map's own colours, so the mark and the map read as one thing */
-.mark { flex: none; width: 30px; height: 30px; }
+/* The V in the app's accent; the hotspot in its point runs up the heat map's own colours and back */
+.mark { flex: none; width: 32px; height: 32px; }
 .mark svg { display: block; width: 100%; height: 100%; }
-.mark .ring { stroke: var(--mark-ring); }
-.mark .spot { fill: var(--ramp-4); }
-/* Slow and quiet: the dashed ring turns once every 24s and the hotspot breathes */
-.mark .ring, .mark .spot { transform-box: fill-box; transform-origin: center; }
-.mark .ring { animation: spin 24s linear infinite; }
-.mark .spot { animation: breathe 3.2s ease-in-out infinite; }
-@keyframes breathe { 50% { transform: scale(0.8); opacity: 0.8; } }
-@media (prefers-reduced-motion: reduce) { .mark .ring, .mark .spot { animation: none !important; } }
-.brand h1 { font-size: 1.15rem; font-weight: 700; letter-spacing: -0.01em; line-height: 1.1; white-space: nowrap; }
+.mark .v { fill: var(--sea); }
+.mark .spot { fill: var(--ramp-3); transform-box: fill-box; transform-origin: center; animation: heat-up 4s ease-in-out infinite; }
+/* Holds cool, warms to the hottest colour as it swells a little, then cools back */
+@keyframes heat-up {
+  0%, 30%, 100% { fill: var(--ramp-3); transform: scale(1); }
+  55% { fill: var(--ramp-4); transform: scale(1.12); }
+  70% { fill: var(--ramp-5); transform: scale(1.18); }
+}
+@media (prefers-reduced-motion: reduce) { .mark .spot { animation: none !important; } }
+.brand h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; line-height: 1.1; white-space: nowrap; }
 .head-search { flex: 1; min-width: 0; display: flex; justify-content: center; }
 .head-search .search { flex: 0 1 420px; height: 38px; }
 .views { flex: none; display: flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
@@ -106,6 +105,13 @@ a { color: var(--sea); }
 .search:focus-within { border-color: var(--sea); }
 .search svg { flex: none; width: 17px; height: 17px; color: var(--faint); }
 .search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font-size: 0.95rem; }
+/* The neighbourhood suggestions: always directly under the search box. It floats, so it is the one thing with a shadow. */
+.search { position: relative; }
+.suggest { position: absolute; z-index: 40; top: calc(100% + 6px); left: -1px; right: -1px; margin: 0; padding: 4px; list-style: none;
+  max-height: min(320px, 60vh); overflow-y: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); }
+.suggest li { padding: 8px 10px; border-radius: 7px; font-size: 0.92rem; cursor: pointer; }
+.suggest li:hover, .suggest li[aria-selected="true"] { background: var(--surface-2); }
 .filters-btn { display: none; }
 .filters-body { display: flex; flex-direction: column; gap: 18px; }
 label.lab, .lab { display: block; font-weight: 700; font-size: 0.85rem; margin-bottom: 7px; }
@@ -269,6 +275,7 @@ body, .site-head, .panel, select, .search { transition: background-color 0.3s, c
   .filters-btn[aria-expanded="true"] { background: var(--sea); color: var(--on-sea); border-color: var(--sea); }
   .filters-body, details.about { display: none; }
   .filters.open { z-index: 12; }
+  .filters:not(.open) { overflow: visible; }   /* the closed panel is one row: let the suggestions hang below it */
   .filters.open .filters-body, .filters.open details.about { display: flex; }
   .filters.open details.about { display: block; }
   .legend { margin-top: 0; display: flex; align-items: center; gap: 8px; }
