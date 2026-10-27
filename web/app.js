@@ -41,7 +41,8 @@ const TIPS = {
   "Traffic collisions with injury": "Injury collisions show up here. Take extra care crossing busy streets, especially after dark.",
 };
 
-// Point layout from prepare_data.py (version 2): [lat, lng, typeIndex, hour (-1 = unknown), year, month*100 + day]
+// Point layout the app works with: [lat, lng, typeIndex, hour (-1 = unknown), year, month*100 + day].
+// data.json version 2 stores points like this; version 3 stores one list per field, see pointRows() below.
 const LAT = 0, LNG = 1, TYPE = 2, HOUR = 3, YEAR = 4, MD = 5;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -720,7 +721,7 @@ function areaStats(ll) {
     now++;
     types.set(p[TYPE], (types.get(p[TYPE]) || 0) + 1);
   }
-  const top = [...types.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => [state.data.types[t].label, n]);
+  const top = [...types.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).map(([t, n]) => [state.data.types[t].label, n]);
   return { name: nearestHood(ll), now, before, change: changeInfo(now, before), top, buckets: partCounts(hours), hours, unknownHour, perYear };
 }
 
@@ -939,7 +940,7 @@ function renderTrends() {
     if (p[HOUR] >= 0) hours[p[HOUR]]++;
     days[weekday(p[YEAR], Math.floor(p[MD] / 100), p[MD] % 100)]++;
   }
-  const top = [...types.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => [state.data.types[t].label, n]);
+  const top = [...types.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).map(([t, n]) => [state.data.types[t].label, n]);
   const ch = changeInfo(total, before);
   const peakHour = hours.indexOf(Math.max(...hours));
   const sel = selectedYears();
@@ -1247,6 +1248,17 @@ syncThemeButton();
 // ---------------------------------------------------------------------
 // Load the data and start
 // ---------------------------------------------------------------------
+// Version 3 of data.json keeps each field in its own list (it downloads much smaller);
+// this puts them back into one row per point. Latitude and longitude are stored as whole
+// numbers of 1/10,000 degree counted from lat0/lng0, so dividing gives the same 4 decimals as before.
+function pointRows(c) {
+  const rows = new Array(c.type.length);
+  for (let i = 0; i < rows.length; i++) {
+    rows[i] = [(c.lat0 + c.lat[i]) / 1e4, (c.lng0 + c.lng[i]) / 1e4, c.type[i], c.hour[i], c.year[i], c.md[i]];
+  }
+  return rows;
+}
+
 async function start() {
   if (location.protocol === "file:") {
     showError(`This page needs a local web server to load its data. In a terminal, go to the <code>web</code> folder and run <code>python -m http.server 8000</code>, then open <code>http://localhost:8000</code>.`);
@@ -1256,6 +1268,7 @@ async function start() {
     const res = await fetch(CONFIG.dataUrl);
     if (!res.ok) throw new Error(res.status);
     state.data = await res.json();
+    if (state.data.version >= 3) state.data.points = pointRows(state.data.points);
   } catch (err) {
     showError(`Couldn't load <code>${CONFIG.dataUrl}</code>. Run <code>python scripts/prepare_data.py</code> from the project folder to create it, then reload this page.`);
     return;

@@ -82,6 +82,10 @@ def extract_csvs(blob, year, folder):
         return paths
 
 
+def incidents(data):
+    return len(data["points"]["type"])
+
+
 def without_timestamp(data):
     return {key: value for key, value in data.items() if key != "generated"}
 
@@ -117,15 +121,15 @@ def main():
         if old and without_timestamp(old) == without_timestamp(new):
             print(f"\nNo change: data.json already holds VPD data to {old['latestDate']}.")
             return
-        if old and len(new["points"]) < len(old["points"]) * (1 - MAX_DROP) and not args.force:
+        if old and incidents(new) < incidents(old) * (1 - MAX_DROP) and not args.force:
             sys.exit(
-                f"\nNot updating: the new data has {len(new['points']):,} incidents on the map against "
-                f"{len(old['points']):,} now. That's more than a {MAX_DROP:.0%} drop, which usually means a "
+                f"\nNot updating: the new data has {incidents(new):,} incidents on the map against "
+                f"{incidents(old):,} now. That's more than a {MAX_DROP:.0%} drop, which usually means a "
                 "broken download. Check GeoDASH, then rerun with --force if the drop is real."
             )
         shutil.copyfile(new_path, OUT)
-        before = f"{old['latestDate']}, {len(old['points']):,} incidents" if old else "no file"
-        print(f"\nUpdated web/data.json: data to {new['latestDate']}, {len(new['points']):,} incidents (was {before}).")
+        before = f"{old['latestDate']}, {incidents(old):,} incidents" if old else "no file"
+        print(f"\nUpdated web/data.json: data to {new['latestDate']}, {incidents(new):,} incidents (was {before}).")
 
 
 if __name__ == "__main__":
