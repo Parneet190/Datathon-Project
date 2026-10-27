@@ -102,19 +102,19 @@ a { color: var(--sea); }
   .app[data-view="trends"] #map .leaflet-bottom.leaflet-right { right: 356px; }   /* the slimmer 340px Trends panel */
   .app[data-view="map"]:has(.area:not(:empty)) #map .leaflet-bottom.leaflet-right { right: 316px; }   /* the slimmer 300px area card */
 }
+/* Area A's and B's colour, for the map handles and the "Place A | B" toggle */
+.ab-a, .slot-pick .ab.a { --slot: var(--sea); }
+.ab-b, .slot-pick .ab.b { --slot: var(--b); }
 /* The A and B handles at the centre of each Compare circle: drag one to move that area */
 #map .ab-handle { display: grid; place-items: center; border-radius: 50%; font-weight: 700; font-size: 0.85rem; cursor: grab;
   color: var(--on-sea); border: 2px solid var(--surface); transition: box-shadow 0.2s, transform 0.12s; }
-#map .ab-handle.ab-a { background: var(--sea); }
-#map .ab-handle.ab-b { background: var(--b); }
-/* A ring on the handle a click will move */
-#map .ab-handle.ab-a.placing { box-shadow: 0 0 0 3px var(--surface), 0 0 0 5px var(--sea); }
-#map .ab-handle.ab-b.placing { box-shadow: 0 0 0 3px var(--surface), 0 0 0 5px var(--b); }
+#map .ab-handle { background: var(--slot); }
+#map .ab-handle.placing { box-shadow: 0 0 0 3px var(--surface), 0 0 0 5px var(--slot); }   /* a ring on the handle a click will move */
 #map .ab-handle.leaflet-drag-target, #map .ab-handle:active { cursor: grabbing; transform: scale(1.1); }
 
 .panel { position: absolute; z-index: 10; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
 .filters { top: 16px; left: 16px; max-height: calc(100% - 32px); width: 312px; padding: 18px; display: flex; flex-direction: column; gap: 18px; overflow-y: auto; }
-.area { top: 16px; right: 16px; width: 344px; max-height: calc(100% - 80px);   /* ends 64px up, like Compare and Trends, clear of a host badge */ overflow-y: auto; padding: 18px; display: none; }
+.area { top: 16px; right: 16px; width: 344px; max-height: calc(100% - 80px); overflow-y: auto; padding: 18px; display: none; }   /* ends 64px up, like Compare and Trends, clear of a host badge */
 .compare { left: 344px; right: 16px; bottom: 64px; max-height: 52%; overflow-y: auto; padding: 16px 18px; display: none; }
 .trends { top: 16px; right: 16px; bottom: 64px; width: 420px; overflow-y: auto; padding: 18px; display: none; }
 .app[data-view="map"] .area, .app[data-view="compare"] .compare, .app[data-view="trends"] .trends { display: block; }
@@ -241,8 +241,7 @@ button.cmp.empty:hover { border-color: var(--muted); }
 .slot-pick .ab { width: 30px; height: 30px; border-radius: 50%; border: 2px solid transparent; background: var(--surface-2); color: var(--muted);
   font-weight: 700; cursor: pointer; transition: background-color 0.2s, color 0.2s, border-color 0.2s, transform 0.12s; }
 .slot-pick .ab:active { transform: scale(0.94); }
-.slot-pick .ab.a[aria-pressed="true"] { background: var(--sea); color: var(--on-sea); }
-.slot-pick .ab.b[aria-pressed="true"] { background: var(--b); color: var(--on-sea); }
+.slot-pick .ab[aria-pressed="true"] { background: var(--slot); color: var(--on-sea); }
 .slot-pick .ab:not([aria-pressed="true"]):hover { border-color: var(--line); color: var(--ink); }
 
 /* ---------------- Trends ---------------- */

@@ -26,13 +26,9 @@ const IN_BUCKET = {
   evening: (h) => h >= 18,
   overnight: (h) => h >= 0 && h < 6,
 };
-// The time-of-day filter is a set of clock hours (0-23), or null for any time. The four parts of the day are
-// shortcuts that add or remove six hours each; the bars under them add or remove single hours.
+// The time-of-day filter is a set of clock hours (0-23), or null for any time (see "Time of day" below)
 const blockHours = (k) => [...Array(24).keys()].filter(IN_BUCKET[k]);
 const hoursFor = (k) => (IN_BUCKET[k] ? new Set(blockHours(k)) : null);
-const fmtHour = (h) => `${h % 12 || 12} ${h < 12 ? "am" : "pm"}`;
-const listJoin = (xs) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
-const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 // A practical line shown under an area, keyed by crime type label
 const TIPS = {
   "Bike theft": "Bike theft is common here. Use a U-lock through the frame and bring your bike inside overnight.",
@@ -59,6 +55,9 @@ const state = {
 };
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => n.toLocaleString("en-CA");
+const fmtHour = (h) => `${h % 12 || 12} ${h < 12 ? "am" : "pm"}`;
+const listJoin = (xs) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const phoneQuery = window.matchMedia("(max-width: 760px)");   // matches the phone layout in styles.css
 const isPhone = () => phoneQuery.matches;
@@ -390,23 +389,6 @@ function compareName() {
 }
 const typeLabel = () => (state.type === "all" ? "All types" : state.data.types[state.type].label);
 const filterLine = () => `${state.type === "all" ? "All types" : typeLabel()}, ${timeLabel()}`;
-// None or all 24 hours both mean any time
-function setHours(set) { state.hours = !set || set.size === 0 || set.size === 24 ? null : set; }
-// The picked hours in words: "any time", whole parts of the day ("afternoon and evening"),
-// or runs of hours read from 6 am round to 6 am like the track ("5 pm–9 pm and 12 am–2 am")
-function timeLabel() {
-  if (!state.hours) return "any time";
-  const whole = Object.keys(IN_BUCKET).filter((k) => blockHours(k).every((h) => state.hours.has(h)));
-  if (whole.length * 6 === state.hours.size) return listJoin(whole);
-  const runs = [];
-  for (const h of [...Array(24).keys()].map((i) => (i + 6) % 24)) {
-    if (!state.hours.has(h)) continue;
-    const last = runs[runs.length - 1];
-    if (last && last[1] % 24 === h) last[1] = h + 1; else runs.push([h, h + 1]);
-  }
-  if (runs.length > 1 && runs[runs.length - 1][1] % 24 === runs[0][0]) runs[0][0] = runs.pop()[0];   // joined across 6 am
-  return listJoin(runs.map(([a, b]) => `${fmtHour(a)}–${fmtHour(b % 24)}`));
-}
 
 // Up / down / about the same, compared with the year before
 function changeInfo(now, before) {
@@ -420,6 +402,152 @@ function changeInfo(now, before) {
   const pct = Math.round(((now - before) / before) * 100);
   if (Math.abs(pct) < 5) return { cls: "", text: `Steady vs ${name}`, pct };
   return pct > 0 ? { cls: "up", text: `↑ ${pct}% vs ${name}`, pct } : { cls: "down", text: `↓ ${Math.abs(pct)}% vs ${name}`, pct };
+}
+
+// ---------------------------------------------------------------------
+// Time of day: the picked hours, what they're called, and when an area is busiest
+// ---------------------------------------------------------------------
+// The four parts of the day are shortcuts that add or remove six hours each; the bars under them add or
+// remove single hours. Everything is read from 6 am round to 6 am, like the track.
+const TRACK_ORDER = Array.from({ length: 24 }, (_, i) => (i + 6) % 24);
+// None or all 24 hours both mean any time
+function setHours(set) { state.hours = !set || set.size === 0 || set.size === 24 ? null : set; }
+// The picked hours in words: "any time", whole parts of the day ("afternoon and evening"),
+// or runs of hours ("5 pm–9 pm and 12 am–2 am")
+function timeLabel() {
+  if (!state.hours) return "any time";
+  const whole = Object.keys(IN_BUCKET).filter((k) => blockHours(k).every((h) => state.hours.has(h)));
+  if (whole.flatMap(blockHours).length === state.hours.size) return listJoin(whole);
+  const runs = [];
+  for (const h of TRACK_ORDER) {
+    if (!state.hours.has(h)) continue;
+    const last = runs[runs.length - 1];
+    if (last && last[1] % 24 === h) last[1] = h + 1; else runs.push([h, h + 1]);
+  }
+  if (runs.length > 1 && runs[runs.length - 1][1] % 24 === runs[0][0]) runs[0][0] = runs.pop()[0];   // joined across 6 am
+  return listJoin(runs.map(([a, b]) => `${fmtHour(a)}–${fmtHour(b % 24)}`));
+}
+
+// Reports per part of the day, from reports per clock hour
+const partCounts = (hours) => Object.fromEntries(Object.keys(IN_BUCKET).map((k) => [k, blockHours(k).reduce((s, h) => s + hours[h], 0)]));
+const periodTotal = (buckets) => Object.values(buckets).reduce((a, b) => a + b, 0);
+// "Busiest" compares incidents per hour. With four equal six-hour parts that's the same as comparing counts,
+// but keeping it per hour means the rule stays right if the parts ever change length.
+const MIN_FOR_BUSIEST = 20;   // too few incidents with a known time and any "busiest" is mostly chance
+const CLEAR_LEAD = 1.25;      // the busiest period's rate must beat the next one by a quarter to be named
+function busiestTime(buckets) {
+  const total = periodTotal(buckets);
+  if (total < MIN_FOR_BUSIEST) return null;
+  const [first, second] = Object.keys(IN_BUCKET)
+    .map((k) => [k, buckets[k] / blockHours(k).length])
+    .sort((a, b) => b[1] - a[1]);
+  return first[1] >= second[1] * CLEAR_LEAD ? first[0] : null;
+}
+function timeTiles(buckets) {
+  const top = busiestTime(buckets);
+  return `<div class="tiles">${Object.keys(IN_BUCKET).map((k) =>
+    `<div class="${k === top ? "top" : ""}"><p>${cap(k)}</p><p>${fmt(buckets[k])}</p></div>`).join("")}</div>`;
+}
+// One line that makes the per-hour comparison readable without new units
+function busiestLine(buckets) {
+  const total = periodTotal(buckets), top = busiestTime(buckets);
+  if (!total) return "";
+  if (!top) return `<p class="hint">${total < MIN_FOR_BUSIEST ? "Too few with a known time to say when is busiest." : "No part of the day stands out."}</p>`;
+  return `<p class="hint">${cap(top)} is the busiest part of the day: ${Math.round((buckets[top] / total) * 100)}% of reports in ${blockHours(top).length} of 24 hours.</p>`;
+}
+// The same answer in a few words, for Compare's cards
+function busiestShort(buckets) {
+  const total = periodTotal(buckets), top = busiestTime(buckets);
+  if (!total) return "–";
+  return top ?? (total < MIN_FOR_BUSIEST ? "too few to tell" : "no clear peak");
+}
+// The area card's bar per hour; the busiest part's hours in the accent colour
+function hourStrip(hours, buckets) {
+  const max = Math.max(1, ...hours), top = busiestTime(buckets);
+  return `<div class="hbars hbars-sm">${TRACK_ORDER.map((h, i) =>
+    `<i class="${top && IN_BUCKET[top](h) ? "on" : ""}" style="height:${(hours[h] / max) * 100}%;--i:${i}" title="${fmtHour(h)}: ${fmt(hours[h])}"></i>`).join("")}</div>
+    <div class="hbars-x"><span>6 am</span><span>12 pm</span><span>6 pm</span><span>12 am</span><span>6 am</span></div>`;
+}
+
+// The chart inside the time-of-day track: reports per hour for the chosen years and crime type. Each bar is
+// a button for its hour; the picked hours are in the accent. Returns the counts per clock hour.
+function drawTrackBars() {
+  const hours = new Array(24).fill(0);
+  for (const p of state.data.points) if (p[HOUR] >= 0 && matches(p, state.shown, { ignoreTime: true })) hours[p[HOUR]]++;
+  const max = Math.max(1, ...hours), strip = $("track-bars");
+  if (strip.children.length !== 24)   // made once, so later changes animate
+    strip.innerHTML = TRACK_ORDER.map((h) => `<button type="button" class="hr" data-hour="${h}" aria-label="${fmtHour(h)}"><i></i></button>`).join("");
+  for (const bar of strip.children) {
+    const h = Number(bar.dataset.hour);
+    bar.firstChild.style.height = `${(hours[h] / max) * 100}%`;
+    bar.setAttribute("aria-pressed", String(!!state.hours?.has(h)));   // blue only for hours you picked; grey for any time
+    bar.title = `${fmtHour(h)}: ${fmt(hours[h])} reports`;
+  }
+  return hours;
+}
+function syncTimeButtons() {
+  for (const btn of document.querySelectorAll("#time button[data-time]")) {
+    if (btn.dataset.time === "any") { btn.hidden = !state.hours; continue; }   // "Clear" only once the day is narrowed down
+    // Any time is the whole day, so all four parts show as picked (like every year under "All years")
+    const hs = blockHours(btn.dataset.time), n = state.hours ? hs.filter((h) => state.hours.has(h)).length : hs.length;
+    btn.setAttribute("aria-pressed", n === hs.length ? "true" : n ? "mixed" : "false");
+  }
+}
+
+function bindTimeControls() {
+  // The parts of the day: from any time, a tap picks just that part (like years); after that each tap adds
+  // or removes its six hours. The "any" link clears the selection.
+  $("time").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-time]");
+    if (!btn) return;
+    const k = btn.dataset.time;
+    if (k === "any") setHours(null);
+    else if (!state.hours) setHours(hoursFor(k));
+    else {
+      const set = new Set(state.hours), hs = blockHours(k), all = hs.every((h) => set.has(h));
+      for (const h of hs) all ? set.delete(h) : set.add(h);
+      setHours(set);
+    }
+    refresh();
+  });
+
+  // The hour bars: click one to add or remove it, or drag across several to paint a range. Only the bars
+  // update while dragging; the map catches up when the pointer is let go.
+  const strip = $("track-bars");
+  let painting = null, paintSet = null;   // while dragging: whether hours are being added or removed, and the working set
+  const paintHour = (h) => {
+    if (paintSet.has(h) === painting) return;
+    painting ? paintSet.add(h) : paintSet.delete(h);
+    strip.querySelector(`[data-hour="${h}"]`).setAttribute("aria-pressed", String(painting));
+  };
+  strip.addEventListener("pointerdown", (e) => {
+    const bar = e.target.closest("[data-hour]");
+    if (!bar) return;
+    e.preventDefault();
+    paintSet = state.hours ? new Set(state.hours) : new Set();   // from any time, start from no hours
+    painting = !paintSet.has(Number(bar.dataset.hour));
+    paintHour(Number(bar.dataset.hour));
+  });
+  strip.addEventListener("pointermove", (e) => {
+    if (painting === null) return;
+    const bar = document.elementFromPoint(e.clientX, e.clientY)?.closest("#track-bars [data-hour]");
+    if (bar) paintHour(Number(bar.dataset.hour));
+  });
+  window.addEventListener("pointerup", () => {
+    if (painting === null) return;
+    painting = null;
+    setHours(paintSet);
+    refresh();
+  });
+  // Keyboard (Enter or Space on a bar) arrives as a click with no pointer
+  strip.addEventListener("click", (e) => {
+    const bar = e.target.closest("[data-hour]");
+    if (!bar || e.detail !== 0) return;
+    const set = state.hours ? new Set(state.hours) : new Set(), h = Number(bar.dataset.hour);
+    set.has(h) ? set.delete(h) : set.add(h);
+    setHours(set);
+    refresh();
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -465,13 +593,13 @@ function updateHeat() {
   drawHeat();
   // With a time of day picked, say how its share of reports compares with its share of the clock
   let share = "";
+  const byHour = drawTrackBars();
   if (n && hrs && count) {
-    const known = state.data.points.filter((p) => p[HOUR] >= 0 && matches(p, state.shown, { ignoreTime: true })).length;
+    const known = byHour.reduce((a, b) => a + b, 0);   // reports with a known time, at any hour
     const rate = count / known / (hrs / 24);
     share = `<span class="share">${cap(timeLabel())}: ${Math.round((count / known) * 100)}% of reports in ${hrs} of 24 hours, ` +
       `${Math.abs(rate - 1) < 0.1 ? "about the same as the average hour" : `about ${rate.toFixed(1)}× the average hour`}.</span>`;
   }
-  drawTrackBars();
   $("citywide").innerHTML = n
     ? `<strong data-count="${count}" data-key="city">${fmt(count)}</strong> reported city-wide ${periodLabel()}${share}`
     : `Pick a year to see reported incidents.`;
@@ -580,23 +708,19 @@ function nearestHood(ll) {
 function areaStats(ll) {
   const local = state.data.points.filter(nearFn(ll));
   let now = 0, before = 0, unknownHour = 0;
-  const types = new Map(), buckets = Object.fromEntries(Object.keys(IN_BUCKET).map((k) => [k, 0])), hours = new Array(24).fill(0), perYear = new Map();
+  const types = new Map(), hours = new Array(24).fill(0), perYear = new Map();
   for (const p of local) {
     if (matches(p, state.compare)) before++;
     if (passesFilters(p)) perYear.set(p[YEAR], (perYear.get(p[YEAR]) || 0) + 1);   // every year, for the trend
     if (matches(p, state.shown, { ignoreTime: true })) {                            // time of day uses all times
-      if (p[HOUR] < 0) unknownHour++;
-      else {
-        hours[p[HOUR]]++;
-        for (const b in IN_BUCKET) if (IN_BUCKET[b](p[HOUR])) buckets[b]++;
-      }
+      if (p[HOUR] < 0) unknownHour++; else hours[p[HOUR]]++;
     }
     if (!matches(p, state.shown)) continue;
     now++;
     types.set(p[TYPE], (types.get(p[TYPE]) || 0) + 1);
   }
   const top = [...types.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => [state.data.types[t].label, n]);
-  return { name: nearestHood(ll), now, before, change: changeInfo(now, before), top, buckets, hours, unknownHour, perYear };
+  return { name: nearestHood(ll), now, before, change: changeInfo(now, before), top, buckets: partCounts(hours), hours, unknownHour, perYear };
 }
 
 // Small HTML pieces
@@ -605,48 +729,6 @@ function typeBars(top, count = 4) {
   const max = top[0][1];
   return `<div class="bars">${top.slice(0, count).map(([t, n], i) =>
     `<span>${t}</span><div class="bar"><span style="width:${(n / max) * 100}%;--i:${i}"></span></div><span class="n">${fmt(n)}</span>`).join("")}</div>`;
-}
-// "Busiest" compares incidents per hour. With four equal six-hour parts that's the same as comparing counts,
-// but keeping it per hour means the rule stays right if the parts ever change length.
-const PERIOD_HOURS = { morning: 6, afternoon: 6, evening: 6, overnight: 6 };
-const PERIOD_LABELS = { morning: "Morning", afternoon: "Afternoon", evening: "Evening", overnight: "Overnight" };
-const periodTotal = (buckets) => Object.values(buckets).reduce((a, b) => a + b, 0);
-const MIN_FOR_BUSIEST = 20;   // too few incidents with a known time and any "busiest" is mostly chance
-const CLEAR_LEAD = 1.25;      // the busiest period's rate must beat the next one by a quarter to be named
-function busiestTime(buckets) {
-  const total = periodTotal(buckets);
-  if (total < MIN_FOR_BUSIEST) return null;
-  const [first, second] = Object.keys(PERIOD_HOURS)
-    .map((k) => [k, buckets[k] / PERIOD_HOURS[k]])
-    .sort((a, b) => b[1] - a[1]);
-  return first[1] >= second[1] * CLEAR_LEAD ? first[0] : null;
-}
-function timeTiles(buckets) {
-  const top = busiestTime(buckets);
-  return `<div class="tiles">${Object.keys(PERIOD_LABELS).map((k) =>
-    `<div class="${k === top ? "top" : ""}"><p>${PERIOD_LABELS[k]}</p><p>${fmt(buckets[k])}</p></div>`).join("")}</div>`;
-}
-// One line that makes the per-hour comparison readable without new units
-function busiestLine(buckets) {
-  const total = periodTotal(buckets), top = busiestTime(buckets);
-  if (!total) return "";
-  if (!top) return `<p class="hint">${total < MIN_FOR_BUSIEST ? "Too few with a known time to say when is busiest." : "No part of the day stands out."}</p>`;
-  return `<p class="hint">${PERIOD_LABELS[top]} is the busiest part of the day: ${Math.round((buckets[top] / total) * 100)}% of reports in ${PERIOD_HOURS[top]} of 24 hours.</p>`;
-}
-// The same answer in a few words, for Compare's cards
-function busiestShort(buckets) {
-  const total = periodTotal(buckets), top = busiestTime(buckets);
-  if (!total) return "–";
-  return top ? PERIOD_LABELS[top].toLowerCase() : total < MIN_FOR_BUSIEST ? "too few to tell" : "no clear peak";
-}
-// A bar per hour, from 6 am round to 6 am like the time-of-day track; the busiest part's hours in the accent colour
-function hourStrip(hours, buckets) {
-  const max = Math.max(1, ...hours), top = busiestTime(buckets);
-  const periodOf = (h) => Object.keys(IN_BUCKET).find((k) => IN_BUCKET[k](h));
-  const order = Array.from({ length: 24 }, (_, i) => (i + 6) % 24);
-  return `<div class="hbars hbars-sm">${order.map((h, i) =>
-    `<i class="${periodOf(h) === top ? "on" : ""}" style="height:${(hours[h] / max) * 100}%;--i:${i}" title="${h % 12 || 12} ${h < 12 ? "am" : "pm"}: ${fmt(hours[h])}"></i>`).join("")}</div>
-    <div class="hbars-x"><span>6 am</span><span>12 pm</span><span>6 pm</span><span>12 am</span><span>6 am</span></div>`;
 }
 function yearSpark(perYear) {
   const ys = state.data.years, first = ys[0], last = ys[ys.length - 1], missing = missingYears();
@@ -675,23 +757,6 @@ const pickYear = `<div class="tip">${ICON_INFO}<span>Pick a year in the filters 
 // ---------------------------------------------------------------------
 // Feedback: numbers that roll, panels that arrive, notes over the map
 // ---------------------------------------------------------------------
-// The chart inside the time-of-day track: reports per hour for the chosen years and crime type, from 6 am
-// round to 6 am like the track itself. Each bar is a button for its hour; the picked hours are in the accent.
-const TRACK_ORDER = Array.from({ length: 24 }, (_, i) => (i + 6) % 24);
-function drawTrackBars() {
-  const hours = new Array(24).fill(0);
-  for (const p of state.data.points) if (p[HOUR] >= 0 && matches(p, state.shown, { ignoreTime: true })) hours[p[HOUR]]++;
-  const max = Math.max(1, ...hours), strip = $("track-bars");
-  if (strip.children.length !== 24)   // made once, so later changes animate
-    strip.innerHTML = TRACK_ORDER.map((h) => `<button type="button" class="hr" data-hour="${h}" aria-label="${fmtHour(h)}"><i></i></button>`).join("");
-  for (const bar of strip.children) {
-    const h = Number(bar.dataset.hour);
-    bar.firstChild.style.height = `${(hours[h] / max) * 100}%`;
-    bar.setAttribute("aria-pressed", String(!!state.hours?.has(h)));   // blue only for hours you picked; grey for any time
-    bar.title = `${fmtHour(h)}: ${fmt(hours[h])} reports`;
-  }
-}
-
 // Numbers roll from their last value to the new one, so a change in the filters reads as a change
 const lastCount = {};
 function countUp(root) {
@@ -876,7 +941,6 @@ function renderTrends() {
   const top = [...types.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => [state.data.types[t].label, n]);
   const ch = changeInfo(total, before);
   const peakHour = hours.indexOf(Math.max(...hours));
-  const hourName = (h) => `${h % 12 || 12} ${h < 12 ? "am" : "pm"}`;
   const sel = selectedYears();
   let second;
   if (ch && ch.pct !== undefined) second = `<p>vs ${compareName()}</p><p class="${ch.cls}">${ch.pct > 0 ? "+" : ""}${ch.pct}%</p><p>${fmt(before)} then</p>`;
@@ -907,7 +971,7 @@ function renderTrends() {
     <div class="metrics">
       <div class="metric"><p>Reported incidents</p><p data-count="${total}" data-key="trend">${fmt(total)}</p><p>${sel.length === 1 && isPartial(sel[0]) ? `Jan 1 to ${throughLabel()}` : `${sel.length} year${sel.length !== 1 ? "s" : ""}`}</p></div>
       <div class="metric">${second}</div>
-      <div class="metric"><p>Busiest hour</p><p>${total ? hourName(peakHour) : "–"}</p><p>Across the city</p></div>
+      <div class="metric"><p>Busiest hour</p><p>${total ? fmtHour(peakHour) : "–"}</p><p>Across the city</p></div>
       <div class="metric">${fourth}</div>
     </div>
     <div class="tsec"><h3>Year by year</h3>
@@ -916,7 +980,7 @@ function renderTrends() {
         : `<i class="${state.years.has(y) ? "on" : ""} ${isPartial(y) ? "part" : ""}" style="height:${((perYear.get(y) || 0) / maxY) * 100}%;--i:${i}" title="${y}: ${fmt(perYear.get(y) || 0)}"></i>`}<span>${String(y).slice(2)}</span></div>`).join("")}</div>
       <p class="hint">Coloured bars are the years you've selected.${missing.length ? ` No data for ${missing.join(", ")}.` : ""}${state.data.partialYear ? ` ${state.data.partialYear} runs to ${throughLabel()}.` : ""}</p></div>
     <div class="tsec"><h3>Hour of the day</h3>
-      <div class="hbars">${hours.map((n, h) => `<i style="height:${(n / maxH) * 100}%;--i:${h}" title="${hourName(h)}: ${fmt(n)}"></i>`).join("")}</div>
+      <div class="hbars">${hours.map((n, h) => `<i style="height:${(n / maxH) * 100}%;--i:${h}" title="${fmtHour(h)}: ${fmt(n)}"></i>`).join("")}</div>
       <div class="hbars-x"><span>12 am</span><span>6 am</span><span>12 pm</span><span>6 pm</span><span>11 pm</span></div></div>
     ${state.type === "all" ? `<div class="tsec"><h3>Most common</h3>${typeBars(top, 6)}</div>` : ""}
     ${areaHtml}`;
@@ -1012,59 +1076,7 @@ function buildControls() {
     refresh();
   });
 
-  // The parts of the day: from any time, a tap picks just that part (like years); after that each tap adds
-  // or removes its six hours. The "any" link clears the selection.
-  $("time").addEventListener("click", (e) => {
-    const btn = e.target.closest("button[data-time]");
-    if (!btn) return;
-    const k = btn.dataset.time;
-    if (k === "any") setHours(null);
-    else if (!state.hours) setHours(hoursFor(k));
-    else {
-      const set = new Set(state.hours), hs = blockHours(k), all = hs.every((h) => set.has(h));
-      for (const h of hs) all ? set.delete(h) : set.add(h);
-      setHours(set);
-    }
-    refresh();
-  });
-
-  // The hour bars: click one to add or remove it, or drag across several to paint a range. Only the bars
-  // update while dragging; the map catches up when the pointer is let go.
-  const strip = $("track-bars");
-  let painting = null, paintSet = null;   // while dragging: whether hours are being added or removed, and the working set
-  const paintHour = (h) => {
-    if (paintSet.has(h) === painting) return;
-    painting ? paintSet.add(h) : paintSet.delete(h);
-    strip.querySelector(`[data-hour="${h}"]`).setAttribute("aria-pressed", String(painting));
-  };
-  strip.addEventListener("pointerdown", (e) => {
-    const bar = e.target.closest("[data-hour]");
-    if (!bar) return;
-    e.preventDefault();
-    paintSet = state.hours ? new Set(state.hours) : new Set();   // from any time, start from no hours
-    painting = !paintSet.has(Number(bar.dataset.hour));
-    paintHour(Number(bar.dataset.hour));
-  });
-  strip.addEventListener("pointermove", (e) => {
-    if (painting === null) return;
-    const bar = document.elementFromPoint(e.clientX, e.clientY)?.closest("#track-bars [data-hour]");
-    if (bar) paintHour(Number(bar.dataset.hour));
-  });
-  window.addEventListener("pointerup", () => {
-    if (painting === null) return;
-    painting = null;
-    setHours(paintSet);
-    refresh();
-  });
-  // Keyboard (Enter or Space on a bar) arrives as a click with no pointer
-  strip.addEventListener("click", (e) => {
-    const bar = e.target.closest("[data-hour]");
-    if (!bar || e.detail !== 0) return;
-    const set = state.hours ? new Set(state.hours) : new Set(), h = Number(bar.dataset.hour);
-    set.has(h) ? set.delete(h) : set.add(h);
-    setHours(set);
-    refresh();
-  });
+  bindTimeControls();
 
   // Neighbourhood search: pick from the list (or type part of a name and press Enter)
   const goToHood = () => {
@@ -1153,14 +1165,6 @@ function buildControls() {
   }
 }
 
-function syncTimeButtons() {
-  for (const btn of document.querySelectorAll("#time button[data-time]")) {
-    if (btn.dataset.time === "any") { btn.hidden = !state.hours; continue; }   // "Clear" only once the day is narrowed down
-    // Any time is the whole day, so all four parts show as picked (like every year under "All years")
-    const n = state.hours ? blockHours(btn.dataset.time).filter((h) => state.hours.has(h)).length : 6;
-    btn.setAttribute("aria-pressed", n === 6 ? "true" : n ? "mixed" : "false");
-  }
-}
 function syncYearButtons() {
   const all = allSelected() && state.data.years.length > 1;
   for (const btn of document.querySelectorAll("#years button")) {
