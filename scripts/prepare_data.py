@@ -54,6 +54,14 @@ TYPE_LABELS = {
 # VPD randomizes these locations across several blocks, so the app flags them as area-level only.
 BLURRED_TYPES = {"Offence Against a Person", "Homicide"}
 
+
+def plain(text):
+    """VPD's type and neighbourhood names end up in the page's HTML, so refuse anything that could become markup."""
+    if any(c in text for c in "<>\"'`"):
+        sys.exit(f"Unexpected characters in VPD text, not publishing: {text!r}")
+    return text
+
+
 # Rough box around the City of Vancouver; anything outside is treated as bad data.
 LAT_RANGE = (49.19, 49.32)
 LNG_RANGE = (-123.28, -123.00)
@@ -193,7 +201,7 @@ def main():
         if latest is None or d > latest:
             latest = d
 
-        vpd_type = (row.get("TYPE") or "").strip() or "Unknown"
+        vpd_type = plain((row.get("TYPE") or "").strip() or "Unknown")
         x, y = to_float(row.get("X")), to_float(row.get("Y"))
         if not x or not y:
             stats["skipped: no location (privacy)"] += 1
@@ -217,7 +225,7 @@ def main():
         by_year[d.year] += 1
         by_type[vpd_type] += 1
 
-        hood = (row.get("NEIGHBOURHOOD") or "").strip()
+        hood = plain((row.get("NEIGHBOURHOOD") or "").strip())
         if hood:
             s = hood_sums[hood]
             s[0] += lat
