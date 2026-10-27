@@ -46,15 +46,19 @@ python -m http.server 8000
 
 Then open `http://localhost:8000`. The page needs a local server; opening `index.html` by double-clicking won't load the data.
 
-To rebuild `data.json` from the raw VPD data:
+### Keeping the data up to date
 
-1. Go to [geodash.vpd.ca/opendata](https://geodash.vpd.ca/opendata/), accept the disclaimer, and download each year from 2016 to 2026 (all neighbourhoods, CSV).
-2. Unzip each file into `data/raw/`.
-3. From the project folder, run:
-   ```
-   python scripts/prepare_data.py
-   ```
-   This needs only standard Python, with nothing to install. It prints a summary of rows kept and excluded, and writes `web/data.json`.
+`web/data.json` refreshes itself: every Sunday at 19:00 UTC (noon in Vancouver in summer, 11 am in winter, after VPD republishes GeoDASH that morning), a GitHub Action ([`.github/workflows/update-data.yml`](.github/workflows/update-data.yml)) downloads each year from 2016 to now, rebuilds `data.json` and commits it if anything changed. To run it early, open the **Actions** tab, pick **Update crime data** and click **Run workflow**.
+
+To do the same on your own computer, from the project folder:
+
+```
+python scripts/update_data.py
+```
+
+This needs only standard Python, with nothing to install. It leaves `data.json` alone when VPD has nothing new, and refuses to replace it if the new data has more than 5% fewer incidents, which usually means a broken download (add `--force` if the drop is real). By using the data you agree to VPD's [disclaimer](data/vpd/legal_disclaimer.txt).
+
+To rebuild from CSVs you downloaded yourself, unzip them into `data/raw/` and run `python scripts/prepare_data.py`. It prints a summary of rows kept and excluded, and writes `web/data.json`.
 
 ## Choices we made, and why
 
@@ -232,10 +236,13 @@ Initial exploration of 2026 data (January 1 to October 2, 2026):
 ```
 ├── README.md
 ├── .gitignore            # excludes raw VPD CSVs and zip files
+├── .github/workflows/
+│   └── update-data.yml   # refreshes web/data.json every Sunday
 ├── data/
 │   ├── raw/              # create locally for the VPD CSVs (not in the repo)
 │   └── vpd/              # VPD's legal disclaimer and data description
 ├── scripts/
+│   ├── update_data.py    # downloads the latest VPD data and runs prepare_data.py
 │   └── prepare_data.py   # turns the raw CSVs into web/data.json
 └── web/
     ├── index.html        # the app
