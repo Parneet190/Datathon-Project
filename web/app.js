@@ -1,0 +1,1081 @@
+// ---------------------------------------------------------------------
+// Settings: change these to fit your demo
+// ---------------------------------------------------------------------
+const CONFIG = {
+  dataUrl: "data.json",
+  center: [49.255, -123.12],
+  zoom: 12,
+  minZoom: 11,
+  maxZoom: 16,          // capped on purpose: VPD offsets locations, so street-level detail would mislead
+  radiusMeters: 500,    // size of the area summarized when you click
+  defaultView: "map",   // "map", "compare" or "trends"
+  defaultYears: [2026], // years selected when the page opens: [2026], "all", or several like [2024, 2025, 2026]
+  defaultType: "all",   // or a label such as "Bike theft" to open on your demo situation
+  defaultTime: "any",   // "any", "day", "evening" or "night"
+  heatStrength: 1,      // higher = more of the city lights up; lower = only the strongest hotspots show
+  heatFloor: 0.05,      // faintest a reported spot can be: 0 = quiet areas fully see-through
+  hotspotLevel: 0.95,   // how busy a spot must be to show as dark red: 0.95 = the busiest 5% of the map
+  minForChange: 10,     // don't show a % change when the previous year had fewer incidents than this
+};
+
+const TIME_LABELS = { any: "any time", day: "day", evening: "evening", night: "night" };
+const IN_BUCKET = {
+  day: (h) => h >= 6 && h < 18,
+  evening: (h) => h >= 18 && h < 22,
+  night: (h) => h >= 22 || (h >= 0 && h < 6),
+};
+// A practical line shown under an area, keyed by crime type label
+const TIPS = {
+  "Bike theft": "Bike theft is common here. Use a U-lock through the frame and bring your bike inside overnight.",
+  "Theft from cars": "Theft from cars is common here. Don't leave anything visible in a parked car, even a charging cable.",
+  "Car theft": "Car theft shows up here. Park in a lit or secured spot and keep keys and fobs out of sight at home.",
+  "Home break-ins": "Home break-ins show up here. When viewing a place, ask about building entry, locks and storage security.",
+  "Business break-ins": "Business break-ins are common here, mostly overnight when shops are closed.",
+  "Other theft": "Most reports here are everyday theft. Keep phones and bags close in busy spots.",
+  "Mischief and vandalism": "Much of what's reported here is vandalism and property damage.",
+  "Traffic collisions with injury": "Injury collisions show up here. Take extra care crossing busy streets, especially after dark.",
+};
+
+// Point layout from prepare_data.py (version 2): [lat, lng, typeIndex, hour (-1 = unknown), year, month*100 + day]
+const LAT = 0, LNG = 1, TYPE = 2, HOUR = 3, YEAR = 4, MD = 5;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const CITY_BOUNDS = [[49.198, -123.225], [49.316, -123.023]];
+
+const state = {
+  data: null, years: new Set(), type: "all", time: CONFIG.defaultTime, view: CONFIG.defaultView,
+  selected: null,               // the spot clicked in Map view
+  a: null, b: null, nextSlot: "a",   // the two spots in Compare view
+  shown: null, compare: null,   // which incidents are on the map, and which they're compared with
+};
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n.toLocaleString("en-CA");
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const phoneQuery = window.matchMedia("(max-width: 760px)");   // matches the phone layout in styles.css
+const isPhone = () => phoneQuery.matches;
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+const ICON_BULB = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.8.8 1 1.5 1 2.5h6c0-1 .2-1.7 1-2.5A6 6 0 0 0 12 3z"/></svg>';
+const ICON_INFO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>';
+const ICON_X = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
+
+// ---------------------------------------------------------------------
+// Step 1: the base map of Vancouver
+// ---------------------------------------------------------------------
+const map = L.map("map", {
+  minZoom: CONFIG.minZoom, maxZoom: CONFIG.maxZoom, zoomControl: false,
+  // Quarter steps: whole steps made the opening view round down to half size whenever the city
+  // didn't quite fit at the next level, and made each scroll a jarring jump
+  zoomSnap: 0.25, zoomDelta: 0.5, wheelPxPerZoomLevel: 100,
+}).setView(CONFIG.center, CONFIG.zoom);
+map.setMaxBounds([[49.15, -123.35], [49.36, -122.95]]);
+L.control.zoom({ position: "bottomright" }).addTo(map);
+
+// OpenStreetMap tiles, greyed out with CSS (see --tile-filter) so the heat colours stand out
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  maxZoom: 19,
+}).addTo(map);
+
+// ---------------------------------------------------------------------
+// Step 1b: lighter colour where our data covers, darker everywhere else
+// ---------------------------------------------------------------------
+// The covered area is worked out from the incidents in data.json, so no extra file is needed.
+const SHADE = {
+  // [red, green, blue, strength 0-1] for the area our data covers (inside) and everywhere else (outside)
+  light: { inside: [255, 255, 255, 0.25], outside: [30, 40, 48, 0.6] },
+  dark: { inside: [255, 255, 255, 0.05], outside: [0, 0, 0, 0.6] },
+  cellMeters: 250,                 // grid size used to find the covered area
+  smoothness: 2,                   // how rounded the border is: 0 = blocky, 1 = slight, 2 = smooth, 3 = very smooth
+  edgeSoftness: 0.15,              // 0.05 = crisp edge, 0.5 = soft faded edge
+};
+
+// Two layers: the light inside tint sits below the heat; the dark outside shade sits above it,
+// so any heat that blurs past the city edge (into the water or Burnaby) is dimmed.
+map.createPane("maskInside");
+map.getPane("maskInside").style.zIndex = 350;    // above the grey tiles, below the heat layer (390)
+map.getPane("maskInside").style.pointerEvents = "none";
+map.createPane("maskOutside");
+map.getPane("maskOutside").style.zIndex = 450;   // above the heat layer
+map.getPane("maskOutside").style.pointerEvents = "none";
+let coverage = null;                             // the smoothed coverage grid, kept so the colours can change with the theme
+const maskLayers = [];
+
+function addCoverageMask(points) {
+  const SW = [49.0, -123.6], NE = [49.5, -122.7]; // a box bigger than anything the map can show
+  const dLat = SHADE.cellMeters / 111320;
+  const dLng = dLat / Math.cos((49.25 * Math.PI) / 180);
+  const rows = Math.ceil((NE[0] - SW[0]) / dLat);
+  const cols = Math.ceil((NE[1] - SW[1]) / dLng);
+  const idx = (r, c) => r * cols + c;
+
+  // 1. Mark every grid cell that has at least one incident
+  const has = new Uint8Array(rows * cols);
+  for (const p of points) {
+    const r = Math.floor((p[LAT] - SW[0]) / dLat);
+    const c = Math.floor((p[LNG] - SW[1]) / dLng);
+    if (r >= 0 && r < rows && c >= 0 && c < cols) has[idx(r, c)] = 1;
+  }
+
+  // 2. Grow the marked cells by one so small gaps between them close up
+  const covered = new Uint8Array(rows * cols);
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    for (let a = -1; a <= 1 && !covered[idx(r, c)]; a++) for (let b = -1; b <= 1; b++) {
+      const rr = r + a, cc = c + b;
+      if (rr >= 0 && rr < rows && cc >= 0 && cc < cols && has[idx(rr, cc)]) { covered[idx(r, c)] = 1; break; }
+    }
+  }
+
+  // 3. "Outside" = empty cells you can reach from the edge of the box.
+  //    Empty pockets surrounded by covered cells (parks, etc.) count as inside.
+  const outside = new Uint8Array(rows * cols);
+  const stack = [];
+  for (let r = 0; r < rows; r++) stack.push([r, 0], [r, cols - 1]);
+  for (let c = 0; c < cols; c++) stack.push([0, c], [rows - 1, c]);
+  while (stack.length) {
+    const [r, c] = stack.pop();
+    if (r < 0 || r >= rows || c < 0 || c >= cols) continue;
+    const i = idx(r, c);
+    if (outside[i] || covered[i]) continue;
+    outside[i] = 1;
+    stack.push([r + 1, c], [r - 1, c], [r, c + 1], [r, c - 1]);
+  }
+
+  // 4. Smooth the border: blur the grid (three quick box blurs are close to a Gaussian blur)
+  const field = Float32Array.from(outside);
+  const k = SHADE.smoothness;
+  if (k > 0) {
+    const tmp = new Float32Array(rows * cols);
+    for (let pass = 0; pass < 3; pass++) {
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        let sum = 0, n = 0;
+        for (let d = -k; d <= k; d++) { const cc = c + d; if (cc >= 0 && cc < cols) { sum += field[idx(r, cc)]; n++; } }
+        tmp[idx(r, c)] = sum / n;
+      }
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        let sum = 0, n = 0;
+        for (let d = -k; d <= k; d++) { const rr = r + d; if (rr >= 0 && rr < rows) { sum += tmp[idx(rr, c)]; n++; } }
+        field[idx(r, c)] = sum / n;
+      }
+    }
+  }
+
+  coverage = { field, rows, cols, idx, SW, NE, dLat, dLng };
+  paintCoverage();
+}
+
+// Is this spot in the darkened area outside the data (the water, Burnaby, the North Shore)?
+function isOutside(ll) {
+  if (!coverage) return false;
+  const { field, rows, cols, idx, SW, dLat, dLng } = coverage;
+  const r = Math.floor((ll.lat - SW[0]) / dLat), c = Math.floor((ll.lng - SW[1]) / dLng);
+  return r < 0 || r >= rows || c < 0 || c >= cols || field[idx(r, c)] > 0.5;
+}
+
+// Paint the coverage grid in the current theme's colours (called again when the theme changes)
+function paintCoverage() {
+  if (!coverage) return;
+  const { field, rows, cols, idx, SW, NE } = coverage;
+  const colours = SHADE[document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light"];
+  while (maskLayers.length) map.removeLayer(maskLayers.pop());
+  // Paint at 4x the grid resolution so the curved edge stays smooth (row 0 is the south edge)
+  const UP = 4, W = cols * UP, H = rows * UP;
+  const e = Math.max(SHADE.edgeSoftness, 0.01);
+  const at = (r, c) => field[idx(Math.min(rows - 1, Math.max(0, r)), Math.min(cols - 1, Math.max(0, c)))];
+  const make = (rgba, outsideLayer) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    const img = ctx.createImageData(W, H);
+    for (let y = 0; y < H; y++) {
+      const gr = (H - y - 0.5) / UP - 0.5, r0 = Math.floor(gr), fr = gr - r0;
+      for (let x = 0; x < W; x++) {
+        const gc = (x + 0.5) / UP - 0.5, c0 = Math.floor(gc), fc = gc - c0;
+        const v = (at(r0, c0) * (1 - fc) + at(r0, c0 + 1) * fc) * (1 - fr)
+                + (at(r0 + 1, c0) * (1 - fc) + at(r0 + 1, c0 + 1) * fc) * fr;
+        let t = Math.min(1, Math.max(0, (v - 0.5) / e + 0.5));
+        t = t * t * (3 - 2 * t);                      // 0 = inside, 1 = outside
+        const o = (y * W + x) * 4;
+        img.data[o] = rgba[0]; img.data[o + 1] = rgba[1]; img.data[o + 2] = rgba[2];
+        img.data[o + 3] = 255 * rgba[3] * (outsideLayer ? t : 1 - t);
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return canvas.toDataURL();
+  };
+  maskLayers.push(
+    L.imageOverlay(make(colours.inside, false), [SW, NE], { pane: "maskInside", interactive: false }).addTo(map),
+    L.imageOverlay(make(colours.outside, true), [SW, NE], { pane: "maskOutside", interactive: false }).addTo(map),
+  );
+}
+
+// ---------------------------------------------------------------------
+// Step 2: the heat layer (filled once the data loads)
+// ---------------------------------------------------------------------
+// leaflet.heat paints only the visible rectangle, so zooming out or panning showed a hard edge where the
+// heat just off screen (under the top bar, say) had never been drawn. These versions of its methods paint
+// a margin of HEAT_PAD around the view, the way Leaflet's own vector layers do. They also skip drawing
+// while the map has no size: leaflet.heat threw there and stopped this whole script before the data loaded.
+const HEAT_PAD = 0.35;   // of the map's size, on each side: covers a half-step zoom out or a short pan
+Object.assign(L.HeatLayer.prototype, {
+  _reset() {
+    const map = this._map, size = map.getSize(), pad = size.multiplyBy(HEAT_PAD).round();
+    this._pad = pad; this._center = map.getCenter(); this._zoom = map.getZoom();
+    L.DomUtil.setPosition(this._canvas, map.containerPointToLayerPoint(pad.multiplyBy(-1)));
+    const w = size.x + 2 * pad.x, h = size.y + 2 * pad.y;
+    if (this._heat._width !== w) this._canvas.width = this._heat._width = w;
+    if (this._heat._height !== h) this._canvas.height = this._heat._height = h;
+    this._redraw();
+  },
+  _redraw() {
+    this._frame = null;
+    if (!this._pad || !this._heat._width || !this._heat._height) return;
+    const map = this._map, r = this._heat._r, pad = this._pad, size = map.getSize();
+    const max = this.options.max ?? 1, maxZoom = this.options.maxZoom ?? map.getMaxZoom();
+    const fade = 1 / Math.pow(2, Math.max(0, Math.min(maxZoom - map.getZoom(), 12)));
+    // Points are merged into cells of half the radius, as leaflet.heat does, in canvas pixels
+    const cell = r / 2, pane = map._getMapPanePos(), ox = pane.x % cell, oy = pane.y % cell, cells = new Map();
+    for (const ll of this._latlngs) {
+      const c = map.latLngToContainerPoint(ll), x = c.x + pad.x, y = c.y + pad.y;
+      if (x < -r || y < -r || x > size.x + 2 * pad.x + r || y > size.y + 2 * pad.y + r) continue;
+      const key = Math.floor((x - ox) / cell) * 1e5 + Math.floor((y - oy) / cell), k = (ll[2] ?? 1) * fade, s = cells.get(key);
+      if (s) { s[0] = (s[0] * s[2] + x * k) / (s[2] + k); s[1] = (s[1] * s[2] + y * k) / (s[2] + k); s[2] += k; }
+      else cells.set(key, [x, y, k]);
+    }
+    const data = [...cells.values()].map(([x, y, k]) => [Math.round(x), Math.round(y), Math.min(k, max)]);
+    this._heat.data(data).draw(this.options.minOpacity);
+  },
+  _animateZoom(e) {   // the same arithmetic as Leaflet's padded renderers, with a top-left transform origin
+    const map = this._map, scale = map.getZoomScale(e.zoom, this._zoom);
+    const topLeft = map.getSize().multiplyBy(0.5 + HEAT_PAD).multiplyBy(-scale)
+      .add(map.project(this._center, e.zoom)).subtract(map._getNewPixelOrigin(e.center, e.zoom));
+    L.DomUtil.setTransform(this._canvas, topLeft, scale);
+  },
+});
+// The colours come from --ramp-1..5, so the map and its legend always match the theme
+const heatGradient = () => ({ 0.2: cssVar("--ramp-1"), 0.4: cssVar("--ramp-2"), 0.6: cssVar("--ramp-3"), 0.8: cssVar("--ramp-4"), 1: cssVar("--ramp-5") });
+const heat = L.heatLayer([], {
+  radius: 11,
+  blur: 14,
+  maxZoom: CONFIG.minZoom,   // stops leaflet.heat fading points when zoomed out; drawHeat() scales them instead
+  minOpacity: CONFIG.heatFloor,
+  gradient: heatGradient(),
+}).addTo(map);
+// Its own pane, so it can blend with the map below it (see --heat-blend) and street names show through
+map.createPane("heat");
+map.getPane("heat").style.zIndex = 390;          // above the inside tint, below the circles (400)
+map.getPane("heat").style.pointerEvents = "none";
+map.getPane("heat").appendChild(heat._canvas);
+heat._canvas.style.transformOrigin = "0 0";      // what _animateZoom above expects (leaflet.heat sets 50% 50%)
+
+// Crossfade from the old heat to the new one when the filters change, instead of swapping it in one frame
+function fadeHeat() {
+  const old = heat._canvas;
+  if (reduceMotion || !old.width || !old.height) return;
+  const snap = document.createElement("canvas");
+  snap.width = old.width;
+  snap.height = old.height;
+  snap.getContext("2d").drawImage(old, 0, 0);
+  snap.className = "leaflet-layer heat-snap";
+  snap.style.transform = old.style.transform;
+  old.parentNode.appendChild(snap);
+  old.style.transition = "none";
+  old.style.opacity = 0;
+  // A timer, not animation frames: frames pause in background tabs and would leave the heat hidden
+  setTimeout(() => {
+    old.style.transition = "";
+    old.style.opacity = "";
+    snap.style.opacity = 0;
+  }, 40);
+  setTimeout(() => snap.remove(), 600);
+}
+
+// Circles for the clicked area (Map view) and the two areas (Compare view)
+const circleStyle = (color) => ({ radius: CONFIG.radiusMeters, color, weight: 2, fillOpacity: 0.06, interactive: false });
+const areaCircle = L.circle(CONFIG.center, circleStyle(cssVar("--sea")));
+const circleA = L.circle(CONFIG.center, circleStyle(cssVar("--sea")))
+  .bindTooltip("A", { permanent: true, direction: "center", className: "ab-tip" });
+const circleB = L.circle(CONFIG.center, circleStyle(cssVar("--b")))
+  .bindTooltip("B", { permanent: true, direction: "center", className: "ab-tip" });
+// A dashed preview of the area under the cursor, so you can see what a click will summarize
+const ghost = L.circle(CONFIG.center, { radius: CONFIG.radiusMeters, weight: 1.5, dashArray: "4 6", fill: false, interactive: false });
+const ghostColour = () => cssVar(state.view === "compare" && state.a && (!state.b ? true : state.nextSlot === "b") ? "--b" : "--sea");
+function paintCircles() {
+  areaCircle.setStyle({ color: cssVar("--sea") });
+  circleA.setStyle({ color: cssVar("--sea") });
+  circleB.setStyle({ color: cssVar("--b") });
+  ghost.setStyle({ color: ghostColour() });
+}
+// A clicked area grows out from the click instead of appearing at full size
+function growCircle(c) {
+  if (reduceMotion) return;
+  const t0 = performance.now();
+  const step = (t) => {
+    const k = Math.min(1, (t - t0) / 380);
+    c.setRadius(CONFIG.radiusMeters * (0.15 + 0.85 * (1 - (1 - k) ** 3)));
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// ---------------------------------------------------------------------
+// Years: which incidents are shown, and which year they're compared with
+// ---------------------------------------------------------------------
+const latestMd = () => { const [, m, d] = state.data.latestDate.split("-").map(Number); return m * 100 + d; };
+const throughLabel = () => { const md = latestMd(); return `${MONTHS[Math.floor(md / 100) - 1]} ${md % 100}`; };
+const isPartial = (y) => y === state.data.partialYear;
+// Years inside the data's range that have no incidents at all (e.g. a year missing from the CSV)
+function missingYears() {
+  const ys = state.data.years, out = [];
+  for (let y = ys[0]; y <= ys[ys.length - 1]; y++) if (!ys.includes(y)) out.push(y);
+  return out;
+}
+const selectedYears = () => state.data.years.filter((y) => state.years.has(y));   // oldest first
+const allSelected = () => state.years.size === state.data.years.length;
+
+function buildPeriods() {
+  const ys = selectedYears();
+  state.shown = { years: new Set(ys), maxMd: 1231 };
+  state.compare = null;
+  // With exactly one year selected, compare it with the year before (if that year is in the data).
+  // A part year (like 2026 so far) is compared with the same dates of the year before, so it's fair.
+  if (ys.length === 1 && state.data.years.includes(ys[0] - 1)) {
+    state.compare = { years: new Set([ys[0] - 1]), maxMd: isPartial(ys[0]) ? latestMd() : 1231 };
+  }
+}
+
+// Does an incident pass the type and time-of-day filters? (years not checked)
+function passesFilters(p, { ignoreType = false, ignoreTime = false } = {}) {
+  if (!ignoreType && state.type !== "all" && p[TYPE] !== state.type) return false;
+  if (!ignoreTime && state.time !== "any") {
+    if (p[HOUR] < 0 || !IN_BUCKET[state.time](p[HOUR])) return false;
+  }
+  return true;
+}
+function matches(p, period, opts) {
+  if (!period || !period.years.has(p[YEAR]) || p[MD] > period.maxMd) return false;
+  return passesFilters(p, opts);
+}
+
+// "in 2026 (Jan 1 to Oct 2)", "from 2016 to 2026", or "in 2016–2018 and 2024"
+function periodLabel() {
+  const ys = selectedYears();
+  if (!ys.length) return "with no year picked";
+  if (ys.length === 1) return isPartial(ys[0]) ? `in ${ys[0]} (Jan 1 to ${throughLabel()})` : `in ${ys[0]}`;
+  const runs = [];
+  for (const y of ys) {
+    const last = runs[runs.length - 1];
+    if (last && y === last[1] + 1) last[1] = y; else runs.push([y, y]);
+  }
+  if (runs.length === 1) return `from ${runs[0][0]} to ${runs[0][1]}`;
+  const parts = runs.map(([a, b]) => (a === b ? String(a) : `${a}–${b}`));
+  return `in ${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+function compareName() {
+  const y = selectedYears()[0];
+  return isPartial(y) ? `the same dates in ${y - 1}` : String(y - 1);
+}
+const typeLabel = () => (state.type === "all" ? "All types" : state.data.types[state.type].label);
+const filterLine = () => `${state.type === "all" ? "All types" : typeLabel()}, ${TIME_LABELS[state.time]}`;
+
+// Up / down / about the same, compared with the year before
+function changeInfo(now, before) {
+  const single = state.years.size === 1 ? selectedYears()[0] : null;
+  if (!state.compare) {
+    if (single && missingYears().includes(single - 1)) return { cls: "", text: `No ${single - 1} data to compare` };
+    return null;
+  }
+  const y = selectedYears()[0], name = isPartial(y) ? `same dates ${y - 1}` : String(y - 1);
+  if (before < CONFIG.minForChange) return { cls: "", text: `Too few in ${y - 1} to compare` };
+  const pct = Math.round(((now - before) / before) * 100);
+  if (Math.abs(pct) < 5) return { cls: "", text: `Steady vs ${name}`, pct };
+  return pct > 0 ? { cls: "up", text: `↑ ${pct}% vs ${name}`, pct } : { cls: "down", text: `↓ ${Math.abs(pct)}% vs ${name}`, pct };
+}
+
+// ---------------------------------------------------------------------
+// The heat map
+// ---------------------------------------------------------------------
+// Incidents per year at each location: [lat, lng, count]. heatSpots is what you selected; refSpots is
+// the average year across all the data (same type and time filters), which sets one fixed colour scale,
+// so a year with fewer incidents really does look fainter.
+let heatSpots = [], refSpots = [];
+
+// A part year (2026 so far) counts as a full year's rate, so it compares fairly with whole years
+function yearWeight(y) {
+  if (!isPartial(y)) return 1;
+  const md = latestMd(), day = (Date.UTC(y, Math.floor(md / 100) - 1, md % 100) - Date.UTC(y, 0, 0)) / 864e5;
+  return 365 / day;
+}
+
+// Many incidents share the same hundred-block location, so count repeats as one spot.
+// This looks the same and keeps the map fast with ten years of data.
+function spotsPerYear(test, years) {
+  const spots = new Map(), weight = {};
+  for (const p of state.data.points) {
+    if (!test(p)) continue;
+    const key = Math.round(p[LAT] * 1e4) * 1e7 + Math.round((p[LNG] + 180) * 1e4);
+    const w = (weight[p[YEAR]] ??= yearWeight(p[YEAR]) / years);
+    const spot = spots.get(key);
+    if (spot) spot[2] += w; else spots.set(key, [p[LAT], p[LNG], w]);
+  }
+  return [...spots.values()];
+}
+
+function updateHeat() {
+  const n = state.shown.years.size;
+  const count = n ? state.data.points.filter((p) => matches(p, state.shown)).length : 0;
+  heatSpots = n ? spotsPerYear((p) => matches(p, state.shown), n) : [];
+  refSpots = spotsPerYear((p) => passesFilters(p), state.data.years.length);
+  fadeHeat();
+  drawHeat();
+  $("citywide").innerHTML = n
+    ? `<strong data-count="${count}" data-key="city">${fmt(count)}</strong> reported city-wide ${periodLabel()}`
+    : `Pick a year to see reported incidents.`;
+  countUp($("citywide"));
+}
+
+// Scale the heat so only real hotspots of the average year reach the top colour and quiet areas fade out
+// (instead of the whole city turning orange). Runs again on every zoom.
+function drawHeat() {
+  const z = map.getZoom();
+  const radius = Math.round(8 + (z - CONFIG.minZoom) * 3);   // smaller blobs when zoomed out, so heat stays on land
+  const blur = Math.round(radius * 1.25);
+  // Add up the average year's incidents in screen cells the same way leaflet.heat does, then find how busy a "hotspot" cell is
+  const cellSize = (radius + blur) / 2;
+  const sums = new Map();
+  for (const [lat, lng, n] of refSpots) {
+    const p = map.project([lat, lng], z);
+    const key = Math.floor(p.x / cellSize) * 1e7 + Math.floor(p.y / cellSize);
+    sums.set(key, (sums.get(key) || 0) + n);
+  }
+  const counts = [...sums.values()].sort((a, b) => a - b);
+  const busy = counts.length ? counts[Math.min(counts.length - 1, Math.floor(counts.length * CONFIG.hotspotLevel))] : 1;
+  const scale = CONFIG.heatStrength / Math.max(busy, 1);      // a cell as busy as `busy` shows at full strength
+  heat.setOptions({ radius, blur });
+  heat.setLatLngs(heatSpots.map(([lat, lng, n]) => [lat, lng, n * scale]));
+}
+// While the map zooms, leaflet.heat only stretches its last picture, then redraws it at the new size,
+// which read as a pop. Dim the heat as the zoom starts and bring it back once it's redrawn.
+map.on("zoomstart", () => { heat._canvas.style.opacity = 0.35; });
+map.on("zoomend", () => {
+  if (heatSpots.length) drawHeat();
+  setTimeout(() => { heat._canvas.style.opacity = ""; }, 40);   // after the redraw, so it fades in sharp
+});
+
+// ---------------------------------------------------------------------
+// Keeping the city in view around the floating panels
+// ---------------------------------------------------------------------
+// How much of the map each visible panel covers, as Leaflet padding, for showing `bounds` as large as possible
+function panelPadding(bounds) {
+  const mr = $("map").getBoundingClientRect(), W = mr.width, H = mr.height;
+  const pad = { l: 0, r: 0, t: 0, b: 0 }, corners = [];
+  for (const el of document.querySelectorAll(".panel")) {
+    const rr = el.getBoundingClientRect();
+    if (!rr.width || !rr.height || getComputedStyle(el).display === "none") continue;
+    if (rr.width < W * 0.6) {
+      const left = rr.left - mr.left < W / 2;
+      const side = left ? "l" : "r", across = left ? rr.right - mr.left : mr.right - rr.left;
+      // A tall panel blocks its whole side. A short card in a corner (like "Pick a spot") can be
+      // kept clear from below instead, which matters on tablets where both sides together leave a sliver.
+      if (rr.height > H * 0.5) pad[side] = Math.max(pad[side], across);
+      else corners.push({ side, across, below: rr.top - mr.top < H / 2 ? ["t", rr.bottom - mr.top] : ["b", mr.bottom - rr.top] });
+    } else if (rr.top - mr.top < H / 2) pad.t = Math.max(pad.t, rr.bottom - mr.top);
+    else pad.b = Math.max(pad.b, mr.bottom - rr.top);
+  }
+  const gap = 16;
+  const asPadding = (p) => ({ paddingTopLeft: [p.l + gap, p.t + gap], paddingBottomRight: [p.r + gap, p.b + gap] });
+  // Try each corner card as a side block or as a top/bottom block, and keep whichever shows `bounds` largest
+  let options = [pad];
+  for (const c of corners) {
+    options = options.flatMap((p) => [
+      { ...p, [c.side]: Math.max(p[c.side], c.across) },
+      { ...p, [c.below[0]]: Math.max(p[c.below[0]], c.below[1]) },
+    ]);
+  }
+  const zoomFor = (p) => {
+    const o = asPadding(p);
+    return map.getBoundsZoom(bounds, false, L.point(o.paddingTopLeft).add(o.paddingBottomRight));
+  };
+  return asPadding(options.reduce((best, p) => (zoomFor(p) > zoomFor(best) ? p : best)));
+}
+function fitTo(bounds, maxZoom = 14) {
+  // A normal zoom, not flyTo: the heat layer can follow a normal zoom, but drifts during a flyTo
+  map.fitBounds(bounds, { ...panelPadding(L.latLngBounds(bounds)), maxZoom, animate: !reduceMotion });
+}
+const areaBounds = (ll) => ll.toBounds(CONFIG.radiusMeters * 3.2);
+function fitForView() {
+  if (state.view === "map" && state.selected) return fitTo(areaBounds(state.selected));
+  if (state.view === "compare" && state.a && state.b) return fitTo(areaBounds(state.a).extend(areaBounds(state.b)), 15);
+  if (state.view === "compare" && state.a) return fitTo(areaBounds(state.a));
+  fitTo(L.latLngBounds(CITY_BOUNDS), 13);
+}
+
+// ---------------------------------------------------------------------
+// Area numbers (used by Map and Compare)
+// ---------------------------------------------------------------------
+function nearFn(center) {
+  const cosLat = Math.cos((center.lat * Math.PI) / 180);
+  const r2 = CONFIG.radiusMeters ** 2;
+  return (p) => {
+    const dy = (p[LAT] - center.lat) * 111320;
+    const dx = (p[LNG] - center.lng) * 111320 * cosLat;
+    return dx * dx + dy * dy <= r2;
+  };
+}
+
+// The neighbourhood whose centre is closest, used as a friendly name for a clicked spot
+function nearestHood(ll) {
+  let best = null, bestD = Infinity;
+  for (const h of state.data.neighbourhoods) {
+    const d = (h.lat - ll.lat) ** 2 + ((h.lng - ll.lng) * Math.cos((ll.lat * Math.PI) / 180)) ** 2;
+    if (d < bestD) { bestD = d; best = h; }
+  }
+  return best && Math.sqrt(bestD) * 111.32 < 2.5 ? best.name : "this spot";
+}
+
+function areaStats(ll) {
+  const local = state.data.points.filter(nearFn(ll));
+  let now = 0, before = 0, unknownHour = 0;
+  const types = new Map(), buckets = { day: 0, evening: 0, night: 0 }, perYear = new Map();
+  for (const p of local) {
+    if (matches(p, state.compare)) before++;
+    if (passesFilters(p)) perYear.set(p[YEAR], (perYear.get(p[YEAR]) || 0) + 1);   // every year, for the trend
+    if (matches(p, state.shown, { ignoreTime: true })) {                            // time of day uses all times
+      if (p[HOUR] < 0) unknownHour++;
+      else for (const b in IN_BUCKET) if (IN_BUCKET[b](p[HOUR])) buckets[b]++;
+    }
+    if (!matches(p, state.shown)) continue;
+    now++;
+    types.set(p[TYPE], (types.get(p[TYPE]) || 0) + 1);
+  }
+  const top = [...types.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => [state.data.types[t].label, n]);
+  return { name: nearestHood(ll), now, before, change: changeInfo(now, before), top, buckets, unknownHour, perYear };
+}
+
+// Small HTML pieces
+function typeBars(top, count = 4) {
+  if (!top.length) return `<p class="hint">Nothing reported for these filters.</p>`;
+  const max = top[0][1];
+  return `<div class="bars">${top.slice(0, count).map(([t, n], i) =>
+    `<span>${t}</span><div class="bar"><span style="width:${(n / max) * 100}%;--i:${i}"></span></div><span class="n">${fmt(n)}</span>`).join("")}</div>`;
+}
+const busiestTime = (buckets) => Object.entries(buckets).sort((a, b) => b[1] - a[1])[0][0];
+function timeTiles(buckets) {
+  const total = buckets.day + buckets.evening + buckets.night;
+  const top = total ? busiestTime(buckets) : null, lab = { day: "Day", evening: "Evening", night: "Night" };
+  return `<div class="tiles">${Object.keys(lab).map((k) =>
+    `<div class="${k === top ? "top" : ""}"><p>${lab[k]}</p><p>${fmt(buckets[k])}</p></div>`).join("")}</div>`;
+}
+function yearSpark(perYear) {
+  const ys = state.data.years, first = ys[0], last = ys[ys.length - 1], missing = missingYears();
+  const span = []; for (let y = first; y <= last; y++) span.push(y);
+  const max = Math.max(1, ...span.map((y) => perYear.get(y) || 0));
+  return `<div class="spark">${span.map((y, i) => missing.includes(y)
+    ? `<i class="gap" title="No ${y} data"></i>`
+    : `<i class="${state.years.has(y) ? "on" : ""} ${isPartial(y) ? "part" : ""}" style="height:${((perYear.get(y) || 0) / max) * 100}%;--i:${i}" title="${y}: ${fmt(perYear.get(y) || 0)}"></i>`).join("")}</div>
+    <div class="spark-x"><span>${first}</span>${missing.length ? `<span>${missing.join(", ")} no data</span>` : ""}<span>${last}${state.data.partialYear === last ? "*" : ""}</span></div>`;
+}
+function tipFor(top) {
+  if (state.type !== "all") return TIPS[typeLabel()] || "";
+  const names = top.slice(0, 3).map(([t]) => t);
+  for (const t of ["Bike theft", "Theft from cars", "Home break-ins", "Car theft"]) if (names.includes(t)) return TIPS[t];
+  return names.length ? TIPS[names[0]] || "" : "";
+}
+const blurredNote = () => {
+  const blurred = state.type === "all" ? state.data.types.some((t) => t.blurred) : state.data.types[state.type].blurred;
+  return blurred ? `<p class="foot">VPD spreads the locations of offences against a person across several blocks, so read those as area-level only.</p>` : "";
+};
+const handle = `<button type="button" class="sheet-handle" aria-label="Show or hide details"></button>`;
+// With every year unticked there's nothing to count, so panels say so instead of showing zeros
+const noYears = () => !state.shown.years.size;
+const pickYear = `<div class="tip">${ICON_INFO}<span>Pick a year in the filters to see what's been reported.</span></div>`;
+
+// ---------------------------------------------------------------------
+// Feedback: numbers that roll, panels that arrive, notes over the map
+// ---------------------------------------------------------------------
+// Numbers roll from their last value to the new one, so a change in the filters reads as a change
+const lastCount = {};
+function countUp(root) {
+  for (const el of root.querySelectorAll("[data-count]")) {
+    const to = Number(el.dataset.count), key = el.dataset.key, from = lastCount[key] ?? 0;
+    lastCount[key] = to;
+    if (reduceMotion || from === to) continue;
+    const t0 = performance.now();
+    const step = (t) => {
+      const k = Math.min(1, (t - t0) / 650);
+      el.textContent = fmt(Math.round(from + (to - from) * (1 - (1 - k) ** 3)));
+      if (k < 1 && el.isConnected) requestAnimationFrame(step);
+    };
+    el.textContent = fmt(from);
+    requestAnimationFrame(step);
+  }
+}
+// Replay the panel's arrival when it shows a new spot or view (not on every filter change)
+function enter(el) {
+  el.classList.remove("enter");
+  void el.offsetWidth;   // restart the CSS animation
+  el.classList.add("enter");
+  clearTimeout(el.enterTimer);
+  el.enterTimer = setTimeout(() => el.classList.remove("enter"), 900);   // after the longest bar has grown
+}
+
+// A short note over the map that goes away by itself
+function showToast(message, ms = 4000) {
+  const t = $("toast");
+  t.innerHTML = ICON_INFO;
+  t.append(Object.assign(document.createElement("span"), { textContent: message }));
+  t.classList.add("show");
+  clearTimeout(t.hideTimer);
+  t.hideTimer = setTimeout(() => t.classList.remove("show"), ms);
+}
+
+// ---------------------------------------------------------------------
+// Map view: the area card
+// ---------------------------------------------------------------------
+function renderArea() {
+  // No card until a spot is picked, so it doesn't sit over the map; the hint shows once as a note on open
+  if (!state.selected) { $("area").innerHTML = ""; return; }
+  if (noYears()) {
+    $("area").innerHTML = `${handle}
+      <div class="card-head"><div><p class="place">Near ${nearestHood(state.selected)}</p>
+        <p class="when">Within ${CONFIG.radiusMeters} m</p></div>
+        <button type="button" class="x" data-action="clear" aria-label="Close area summary">${ICON_X}</button></div>${pickYear}`;
+    return;
+  }
+  const s = areaStats(state.selected);
+  const tip = s.now ? tipFor(s.top) : "";
+  $("area").innerHTML = `${handle}
+    <div class="card-head"><div><p class="place">Near ${s.name}</p>
+      <p class="when">Within ${CONFIG.radiusMeters} m · ${periodLabel()}</p></div>
+      <button type="button" class="x" data-action="clear" aria-label="Close area summary">${ICON_X}</button></div>
+    <p class="big" data-count="${s.now}" data-key="area">${fmt(s.now)}</p>
+    <p class="big-label">reported incidents · ${filterLine()}</p>
+    ${s.change ? `<span class="pill ${s.change.cls}">${s.change.text}</span>` : ""}
+    ${state.type === "all" ? `<p class="sec">Most common here</p>${typeBars(s.top)}` : ""}
+    <p class="sec">When they happen</p>${timeTiles(s.buckets)}
+    ${s.unknownHour ? `<p class="hint">${fmt(s.unknownHour)} with no time recorded</p>` : ""}
+    <p class="sec">Year by year</p>${yearSpark(s.perYear)}
+    ${tip ? `<div class="tip">${ICON_BULB}<span>${tip}</span></div>` : ""}
+    ${blurredNote()}
+    <p class="foot">Awareness, not a safety score. Busy areas show more because more people are there.</p>`;
+}
+
+function selectPoint(ll) {
+  state.selected = ll;
+  areaCircle.setLatLng(ll);
+  syncCircles();
+  growCircle(areaCircle);
+  enter($("area"));
+  renderPanels();
+}
+
+// ---------------------------------------------------------------------
+// Compare view: two areas side by side
+// ---------------------------------------------------------------------
+function setCompareSpot(ll) {
+  const slot = !state.a ? "a" : !state.b ? "b" : state.nextSlot;
+  state[slot] = ll;
+  state.nextSlot = slot === "a" ? "b" : "a";
+  syncCircles();
+  growCircle(slot === "a" ? circleA : circleB);
+  renderPanels();
+}
+
+function renderCompare() {
+  const A = state.a && areaStats(state.a), B = state.b && areaStats(state.b);
+  const card = (s, slot) => {
+    const colour = slot === "A" ? "var(--sea)" : "var(--b)";
+    if (!s) return `<div class="cmp empty"><p><b style="color:${colour}">${slot}</b> · Click the map to place area ${slot}</p></div>`;
+    return `<div class="cmp"><p class="who"><b style="background:${colour}">${slot}</b>Near ${s.name}</p>
+      <div><p class="big" data-count="${s.now}" data-key="${slot}">${fmt(s.now)}</p>${s.change ? `<span class="pill ${s.change.cls}">${s.change.text}</span>` : ""}
+        <p class="hint">Busiest: ${s.now ? busiestTime(s.buckets) : "–"}</p></div>
+      <div><p class="sec">Most common</p>${state.type === "all" ? typeBars(s.top, 3) : timeTiles(s.buckets)}</div></div>`;
+  };
+  let insight = "";
+  if (A && B && (A.now || B.now)) {
+    const [hi, lo, hiN, loN] = A.now >= B.now ? [A, B, "A", "B"] : [B, A, "B", "A"];
+    const ratio = hi.now / Math.max(lo.now, 1);
+    const parts = [ratio < 1.15 ? "A and B have a similar number of reports." : `Area ${hiN} has about ${ratio.toFixed(1)}× the reports of area ${loN}.`];
+    // The crime type whose share differs most between the two areas
+    if (state.type === "all" && A.now >= 20 && B.now >= 20) {
+      const share = (s) => new Map(s.top.map(([t, n]) => [t, n / s.now]));
+      const sa = share(A), sb = share(B);
+      let best = null;
+      for (const t of new Set([...sa.keys(), ...sb.keys()])) {
+        const pa = sa.get(t) || 0, pb = sb.get(t) || 0, hiShare = Math.max(pa, pb), loShare = Math.min(pa, pb);
+        if (hiShare < 0.06) continue;
+        const r = hiShare / Math.max(loShare, 0.01);
+        if (r >= 1.6 && (!best || r > best.r)) best = { t, r, where: pa > pb ? "A" : "B", pa, pb };
+      }
+      if (best) parts.push(`${best.t} is a bigger share at ${best.where} (${Math.round(best.where === "A" ? best.pa * 100 : best.pb * 100)}% vs ${Math.round(best.where === "A" ? best.pb * 100 : best.pa * 100)}%).`);
+    }
+    parts.push("Busier spots usually have more people, shops and transit, so they get more reports.");
+    insight = `<div class="tip">${ICON_INFO}<span>${parts.join(" ")}</span></div>`;
+  }
+  $("compare").innerHTML = `${handle}
+    <div class="cmp-head"><div><h2>Compare two areas</h2>
+      <p>Within ${CONFIG.radiusMeters} m of each spot, ${periodLabel()} · ${filterLine()}. Click the map to move A, then B.</p></div>
+      <div class="cmp-actions"><button type="button" class="btn" data-action="swap">Swap</button><button type="button" class="btn" data-action="reset">Clear</button></div></div>
+    ${noYears() ? pickYear : `<div class="cmp-grid">${card(A, "A")}${card(B, "B")}</div>${insight}`}`;
+}
+
+// ---------------------------------------------------------------------
+// Trends view: the whole city for the current filters
+// ---------------------------------------------------------------------
+function weekday(y, m, d) {   // 0 = Sunday (Sakamoto's method)
+  const t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+  if (m < 3) y -= 1;
+  return (y + Math.floor(y / 4) - Math.floor(y / 100) + Math.floor(y / 400) + t[m - 1] + d) % 7;
+}
+
+function renderTrends() {
+  if (noYears()) {
+    $("trends").innerHTML = `${handle}<h2>Vancouver</h2><p class="sub">${filterLine()}.</p>${pickYear}`;
+    return;
+  }
+  const perYear = new Map(), types = new Map(), hours = new Array(24).fill(0), days = new Array(7).fill(0);
+  let total = 0, before = 0;
+  for (const p of state.data.points) {
+    if (!passesFilters(p)) continue;
+    perYear.set(p[YEAR], (perYear.get(p[YEAR]) || 0) + 1);
+    if (matches(p, state.compare)) before++;
+    if (!state.shown.years.has(p[YEAR])) continue;
+    total++;
+    types.set(p[TYPE], (types.get(p[TYPE]) || 0) + 1);
+    if (p[HOUR] >= 0) hours[p[HOUR]]++;
+    days[weekday(p[YEAR], Math.floor(p[MD] / 100), p[MD] % 100)]++;
+  }
+  const top = [...types.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => [state.data.types[t].label, n]);
+  const ch = changeInfo(total, before);
+  const peakHour = hours.indexOf(Math.max(...hours));
+  const hourName = (h) => `${h % 12 || 12} ${h < 12 ? "am" : "pm"}`;
+  const sel = selectedYears();
+  let second;
+  if (ch && ch.pct !== undefined) second = `<p>vs ${compareName()}</p><p class="${ch.cls}">${ch.pct > 0 ? "+" : ""}${ch.pct}%</p><p>${fmt(before)} then</p>`;
+  else if (sel.length > 1) {
+    const busiestYear = sel.reduce((a, y) => ((perYear.get(y) || 0) > (perYear.get(a) || 0) ? y : a), sel[0]);
+    second = `<p>Busiest year</p><p>${busiestYear}</p><p>${fmt(perYear.get(busiestYear) || 0)} incidents</p>`;
+  } else second = `<p>Change</p><p>–</p><p>${ch ? ch.text : "No earlier year"}</p>`;
+  const fourth = state.type === "all" && top.length
+    ? `<p>Most common</p><p>${Math.round((top[0][1] / Math.max(total, 1)) * 100)}%</p><p>${top[0][0]}</p>`
+    : `<p>Busiest day</p><p>${WEEKDAYS[days.indexOf(Math.max(...days))].slice(0, 3)}</p><p>${typeLabel()}</p>`;
+
+  const ys = state.data.years, missing = missingYears(), span = [];
+  for (let y = ys[0]; y <= ys[ys.length - 1]; y++) span.push(y);
+  const maxY = Math.max(1, ...span.map((y) => perYear.get(y) || 0));
+  const maxH = Math.max(1, ...hours);
+
+  let areaHtml = "";
+  if (state.selected) {
+    const s = areaStats(state.selected);
+    areaHtml = `<div class="tsec"><h3>Near ${s.name} (${CONFIG.radiusMeters} m)</h3>
+      <p class="big" style="font-size:1.9rem" data-count="${s.now}" data-key="trend-area">${fmt(s.now)}</p>${s.change ? `<span class="pill ${s.change.cls}">${s.change.text}</span>` : ""}
+      <p class="hint" style="margin-top:8px"><a href="#" data-action="open-map">See the full area summary</a></p></div>`;
+  }
+
+  $("trends").innerHTML = `${handle}
+    <h2>Vancouver ${periodLabel()}</h2>
+    <p class="sub">${filterLine()}. Click the map to add an area.</p>
+    <div class="metrics">
+      <div class="metric"><p>Reported incidents</p><p data-count="${total}" data-key="trend">${fmt(total)}</p><p>${sel.length === 1 && isPartial(sel[0]) ? `Jan 1 to ${throughLabel()}` : `${sel.length} year${sel.length !== 1 ? "s" : ""}`}</p></div>
+      <div class="metric">${second}</div>
+      <div class="metric"><p>Busiest hour</p><p>${total ? hourName(peakHour) : "–"}</p><p>Across the city</p></div>
+      <div class="metric">${fourth}</div>
+    </div>
+    <div class="tsec"><h3>Year by year</h3>
+      <div class="ybars">${span.map((y, i) => `<div>${missing.includes(y)
+        ? `<i class="gap" style="height:30%" title="No ${y} data"></i>`
+        : `<i class="${state.years.has(y) ? "on" : ""} ${isPartial(y) ? "part" : ""}" style="height:${((perYear.get(y) || 0) / maxY) * 100}%;--i:${i}" title="${y}: ${fmt(perYear.get(y) || 0)}"></i>`}<span>${String(y).slice(2)}</span></div>`).join("")}</div>
+      <p class="hint">Coloured bars are the years you've selected.${missing.length ? ` No data for ${missing.join(", ")}.` : ""}${state.data.partialYear ? ` ${state.data.partialYear} runs to ${throughLabel()}.` : ""}</p></div>
+    <div class="tsec"><h3>Hour of the day</h3>
+      <div class="hbars">${hours.map((n, h) => `<i style="height:${(n / maxH) * 100}%;--i:${h}" title="${hourName(h)}: ${fmt(n)}"></i>`).join("")}</div>
+      <div class="hbars-x"><span>12 am</span><span>6 am</span><span>12 pm</span><span>6 pm</span><span>11 pm</span></div></div>
+    ${state.type === "all" ? `<div class="tsec"><h3>Most common</h3>${typeBars(top, 6)}</div>` : ""}
+    ${areaHtml}`;
+}
+
+// ---------------------------------------------------------------------
+// Views, panels and circles
+// ---------------------------------------------------------------------
+function renderPanels() {
+  if (state.view === "map") renderArea();
+  else if (state.view === "compare") renderCompare();
+  else renderTrends();
+  countUp($(PANEL_FOR[state.view]));
+}
+function syncCircles() {
+  const show = (layer, on) => { if (on && !map.hasLayer(layer)) layer.addTo(map); if (!on && map.hasLayer(layer)) map.removeLayer(layer); };
+  show(areaCircle, state.view !== "compare" && !!state.selected);
+  if (state.a) circleA.setLatLng(state.a);
+  if (state.b) circleB.setLatLng(state.b);
+  show(circleA, state.view === "compare" && !!state.a);
+  show(circleB, state.view === "compare" && !!state.b);
+  ghost.setStyle({ color: ghostColour() });
+}
+// Each view's panel, and how far it was scrolled, so switching views puts you back where you were
+const PANEL_FOR = { map: "area", compare: "compare", trends: "trends" };
+const panelScroll = {};
+
+function setView(view) {
+  panelScroll[state.view] = $(PANEL_FOR[state.view]).scrollTop;   // remember the panel you're leaving
+  state.view = view;
+  $("app").dataset.view = view;
+  for (const b of document.querySelectorAll(".views button")) b.setAttribute("aria-pressed", String(b.dataset.view === view));
+  if (view === "compare" && !state.a && state.selected) { state.a = state.selected; state.nextSlot = "b"; }
+  syncCircles();
+  enter($(PANEL_FOR[view]));
+  renderPanels();
+  $(PANEL_FOR[view]).scrollTop = panelScroll[view] || 0;          // and put this one back where it was
+  // The map isn't moved or zoomed: it stays exactly where you left it.
+}
+// ---------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------
+function buildControls() {
+  const { types, neighbourhoods, points } = state.data;
+
+  // Years: an "All years" button, then one button per year, newest first
+  const ys = state.data.years;
+  const missing = missingYears();
+  const span = [];
+  for (let y = ys[ys.length - 1]; y >= ys[0]; y--) span.push(y);   // newest first, gaps included
+  $("years").innerHTML = (ys.length > 1 ? `<button type="button" class="all" data-year="all">All years</button>` : "") +
+    span.map((y) => missing.includes(y)
+      ? `<button type="button" disabled title="No data for ${y}">${y}</button>`
+      : `<button type="button" data-year="${y}">${y}</button>`).join("");
+  // The part year's end date already shows with the count below, so only a gap in the data is worth a line here
+  $("year-hint").textContent = missing.length ? `No data for ${missing.join(", ")}.` : "";
+
+  const start = CONFIG.defaultYears === "all" ? ys : [].concat(CONFIG.defaultYears).map(Number).filter((y) => ys.includes(y));
+  state.years = new Set(start.length ? start : [ys[ys.length - 1]]);   // fall back to the latest year
+
+  $("years").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-year]");
+    if (!btn || btn.disabled) return;
+    if (btn.dataset.year === "all") {
+      state.years = new Set(ys);
+    } else {
+      const y = Number(btn.dataset.year);
+      if (allSelected()) state.years = new Set([y]);          // from "All years", a tap picks just that year
+      else if (!state.years.has(y)) state.years.add(y);       // add a year
+      else state.years.delete(y);                             // remove it, even the last one (the map then clears)
+    }
+    refresh();
+  });
+
+  // Crime types, most common first (across all years)
+  const totals = new Array(types.length).fill(0);
+  for (const p of points) totals[p[TYPE]]++;
+  const order = types.map((_, i) => i).sort((a, b) => totals[b] - totals[a]);
+  $("type").innerHTML = `<option value="all">All types</option>` +
+    order.map((i) => `<option value="${i}">${types[i].label}</option>`).join("");
+  const preset = types.findIndex((t) => t.label === CONFIG.defaultType);
+  if (preset >= 0) { state.type = preset; $("type").value = String(preset); }
+  $("type").addEventListener("change", (e) => {
+    state.type = e.target.value === "all" ? "all" : Number(e.target.value);
+    refresh();
+  });
+
+  $("time").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-time]");
+    if (!btn) return;
+    state.time = btn.dataset.time;
+    refresh();
+  });
+
+  // Neighbourhood search: pick from the list (or type part of a name and press Enter)
+  const goToHood = () => {
+    const q = $("search").value.trim().toLowerCase();
+    if (!q) return;
+    const h = neighbourhoods.find((n) => n.name.toLowerCase() === q) || neighbourhoods.find((n) => n.name.toLowerCase().includes(q));
+    if (!h) return;
+    $("search").value = h.name;
+    const ll = L.latLng(h.lat, h.lng);
+    if (state.view === "compare") setCompareSpot(ll); else selectPoint(ll);
+    if (isPhone()) closeFilters();
+    fitForView();
+  };
+  // The suggestion list: names containing what's typed, alphabetical; arrows move, Enter picks, Escape closes
+  const input = $("search"), list = $("hood-list");
+  const names = neighbourhoods.map((h) => h.name).sort((a, b) => a.localeCompare(b));
+  let shownNames = [], active = -1;
+  const option = (i) => list.children[i];
+  const setActive = (i) => {
+    if (option(active)) option(active).setAttribute("aria-selected", "false");
+    active = i;
+    if (option(i)) { option(i).setAttribute("aria-selected", "true"); option(i).scrollIntoView({ block: "nearest" }); input.setAttribute("aria-activedescendant", option(i).id); }
+    else input.removeAttribute("aria-activedescendant");
+  };
+  const closeList = () => { list.hidden = true; input.setAttribute("aria-expanded", "false"); setActive(-1); };
+  const openList = () => {
+    const q = input.value.trim().toLowerCase();
+    shownNames = names.filter((n) => n.toLowerCase().includes(q));
+    list.replaceChildren(...shownNames.map((n, i) =>
+      Object.assign(document.createElement("li"), { id: `hood-${i}`, role: "option", textContent: n })));
+    list.hidden = !shownNames.length;
+    input.setAttribute("aria-expanded", String(!list.hidden));
+    setActive(-1);
+  };
+  const pick = (name) => { input.value = name; closeList(); goToHood(); };
+  input.addEventListener("focus", openList);
+  input.addEventListener("input", openList);
+  input.addEventListener("blur", closeList);
+  // mousedown, not click, so the input's blur doesn't close the list before the pick lands
+  list.addEventListener("mousedown", (e) => { const li = e.target.closest("li"); if (li) { e.preventDefault(); pick(li.textContent); } });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (list.hidden) openList();
+      const n = shownNames.length;
+      if (n) setActive(e.key === "ArrowDown" ? (active + 1) % n : (active - 1 + n) % n);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (active >= 0) pick(shownNames[active]); else { closeList(); goToHood(); }
+    } else if (e.key === "Escape" && !list.hidden) {
+      e.preventDefault();   // a search box clears itself on Escape, which would reopen the list
+      closeList();
+    }
+  });
+  input.addEventListener("click", () => { if (list.hidden) openList(); });   // already focused, so no focus event
+
+  map.on("click", (e) => {
+    // Outside the data there's nothing to summarize, so say so and keep whatever was selected
+    if (isOutside(e.latlng)) return showToast("That's outside the City of Vancouver, so there's no VPD data for it. Pick a spot in the lit area.");
+    $("toast").classList.remove("show");   // the opening hint has done its job
+    if (state.view === "compare") setCompareSpot(e.latlng); else selectPoint(e.latlng);
+  });
+  if (window.matchMedia("(hover: hover)").matches) {   // no cursor to follow on touch screens
+    map.on("mousemove", (e) => {
+      const out = isOutside(e.latlng);
+      ghost.setLatLng(e.latlng).setStyle({ opacity: out ? 0.25 : 1 });   // the preview fades where a click won't do anything
+      $("map").style.cursor = out ? "default" : "";
+      if (!map.hasLayer(ghost)) ghost.addTo(map);
+    });
+    map.on("mouseout", () => ghost.remove());
+  }
+
+  // Buttons inside the panels (close, swap, clear, open map)
+  for (const id of ["area", "compare", "trends"]) {
+    $(id).addEventListener("click", (e) => {
+      if (e.target.closest(".sheet-handle")) { $(id).classList.toggle("collapsed"); return; }
+      const action = e.target.closest("[data-action]")?.dataset.action;
+      if (!action) return;
+      e.preventDefault();
+      if (action === "clear") { state.selected = null; syncCircles(); renderPanels(); }
+      if (action === "swap") { [state.a, state.b] = [state.b, state.a]; syncCircles(); renderPanels(); }
+      if (action === "reset") { state.a = state.b = null; state.nextSlot = "a"; syncCircles(); renderPanels(); }
+      if (action === "open-map") setView("map");
+    });
+  }
+}
+
+function syncTimeButtons() {
+  for (const btn of document.querySelectorAll("#time button")) btn.setAttribute("aria-pressed", String(btn.dataset.time === state.time));
+  // The hours only for the period picked, instead of a standing line explaining all three
+  const picked = document.querySelector(`#time [data-time="${state.time}"]`);
+  $("time-hint").textContent = picked.title ? `${picked.textContent}: ${picked.title}` : "";
+}
+function syncYearButtons() {
+  const all = allSelected() && state.data.years.length > 1;
+  for (const btn of document.querySelectorAll("#years button")) {
+    const on = btn.dataset.year === "all" ? all : state.years.has(Number(btn.dataset.year));
+    btn.setAttribute("aria-pressed", String(on));
+  }
+}
+
+function refresh() {
+  buildPeriods();
+  syncYearButtons();
+  syncTimeButtons();
+  updateHeat();
+  renderPanels();
+  renderAbout();
+}
+
+function noLocationCount() {
+  let n = 0;
+  for (const [y, count] of Object.entries(state.data.noLocationByYear || {})) if (state.shown.years.has(Number(y))) n += count;
+  return n;
+}
+function renderAbout() {
+  const d = state.data;
+  const through = new Date(d.latestDate + "T12:00:00").toLocaleDateString("en-CA", { year: "numeric", month: "long", day: "numeric" });
+  $("about-body").innerHTML = `
+    <p>Source: Vancouver Police Department, <a href="https://geodash.vpd.ca/opendata/">GeoDASH open data</a>. Data through ${through}.</p>
+    <p>Shows reported incidents that police confirmed occurred, not all crime. Busy areas show more because more people are there. This is for awareness, not a safety score for any address.</p>
+    <p>VPD offsets locations for privacy: property crimes to the hundred block, offences against a person across several blocks. ${fmt(noLocationCount())} incidents ${periodLabel()} have no location and aren't shown.</p>`;
+  const p = d.partialYear;
+  $("legend-title").textContent = state.shown.years.has(p) ? `Per year, ${p} scaled to a full year` : "Incidents per year";
+}
+
+function showError(message) {
+  $("status").innerHTML = `<div>${message}</div>`;
+  $("status").classList.add("show");
+}
+
+// Header buttons: views and theme
+for (const b of document.querySelectorAll(".views button")) {
+  b.addEventListener("click", () => { if (state.data) setView(b.dataset.view); });
+}
+// The search lives in the header, except on phones where the header has no room and it joins the Filters row
+function placeSearch() {
+  (phoneQuery.matches ? $("filters-top") : $("head-search")).prepend(document.querySelector(".search"));
+}
+phoneQuery.addEventListener("change", placeSearch);
+placeSearch();
+function closeFilters() { $("filters").classList.remove("open"); $("filters-btn").setAttribute("aria-expanded", "false"); }
+$("filters-btn").addEventListener("click", () => {
+  const open = !$("filters").classList.contains("open");
+  $("filters").classList.toggle("open", open);
+  $("filters-btn").setAttribute("aria-expanded", String(open));
+});
+
+function syncThemeButton() {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  $("theme-toggle").setAttribute("aria-pressed", String(dark));
+  $("theme-toggle").title = dark ? "Switch to light mode" : "Switch to dark mode";
+  $("theme-toggle").setAttribute("aria-label", dark ? "Switch to light mode" : "Switch to dark mode");
+}
+$("theme-toggle").addEventListener("click", () => {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("theme", next); } catch (e) {}   // remember the choice for next visit
+  syncThemeButton();
+  paintCoverage();                                            // re-colour the inside/outside shading
+  paintCircles();
+  heat.setOptions({ gradient: heatGradient() });
+});
+syncThemeButton();
+
+// ---------------------------------------------------------------------
+// Load the data and start
+// ---------------------------------------------------------------------
+async function start() {
+  if (location.protocol === "file:") {
+    showError(`This page needs a local web server to load its data. In a terminal, go to the <code>web</code> folder and run <code>python -m http.server 8000</code>, then open <code>http://localhost:8000</code>.`);
+    return;
+  }
+  try {
+    const res = await fetch(CONFIG.dataUrl);
+    if (!res.ok) throw new Error(res.status);
+    state.data = await res.json();
+  } catch (err) {
+    showError(`Couldn't load <code>${CONFIG.dataUrl}</code>. Run <code>python scripts/prepare_data.py</code> from the project folder to create it, then reload this page.`);
+    return;
+  }
+  if (!Array.isArray(state.data.years)) {
+    showError(`This <code>data.json</code> was made by the old script. Run <code>python scripts/prepare_data.py</code> from version 2, then reload this page.`);
+    return;
+  }
+  $("status").classList.remove("show");
+  addCoverageMask(state.data.points);
+  buildControls();
+  buildPeriods();
+  setView(["map", "compare", "trends"].includes(CONFIG.defaultView) ? CONFIG.defaultView : "map");
+  refresh();
+  showToast(`Click anywhere on the map to see what's been reported within ${CONFIG.radiusMeters} m, or search a neighbourhood.`, 7000);
+  requestAnimationFrame(() => { map.invalidateSize(); map.fitBounds(CITY_BOUNDS, { ...panelPadding(L.latLngBounds(CITY_BOUNDS)), maxZoom: 13, animate: false }); });
+}
+
+start();
