@@ -17,7 +17,7 @@ It is one input to a newcomer's research, alongside visiting neighbourhoods, tal
 Built from **374,186 mapped incidents reported between January 2016 and October 2, 2026**.
 
 - **Map:** a heat map of reported incidents across the City of Vancouver.
-- **Filters:** choose any year or combination of years from 2016 to 2026, a crime type (for example "Home break-ins" or "Bike theft"), and a time of day (day, evening, night).
+- **Filters:** choose any year or combination of years from 2016 to 2026, a crime type (for example "Home break-ins" or "Bike theft"), and a part of the day (morning, afternoon, evening or overnight, six hours each, so they compare fairly).
 - **Area summary:** click anywhere on the map to see what has been reported within 500 metres of that spot.
 - **Jump to a neighbourhood:** pick a neighbourhood from a list instead of searching the map.
 - **Compare:** view two areas side by side.
