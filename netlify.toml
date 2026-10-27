@@ -1,0 +1,3 @@
+# The site is plain files in web/, with no build step
+[build]
+  publish = "web"
